@@ -1478,10 +1478,15 @@ pub(crate) async fn handle_connection(
         Ok(addr) => Some(addr.ip()),
         Err(_) => None,
     };
+    // Loopback is exempt from the ban machinery: inbound PT connections all
+    // arrive from 127.0.0.1 (the PT forwards them over the loopback ORPORT),
+    // so the real client address is invisible here and a ban would lump every
+    // PT client together. `peer_ip` is still used for logging.
+    let bannable_ip = peer_ip.filter(|ip| !ip.is_loopback());
 
-    // Check if IP is banned (loopback is never banned: PT server connections arrive from 127.0.0.1)
-    if let Some(ip) = peer_ip {
-        if !ip.is_loopback() && active.ban_list.is_banned(ip).await {
+    // Check if IP is banned
+    if let Some(ip) = bannable_ip {
+        if active.ban_list.is_banned(ip).await {
             return Err(format!("IP {} is temporarily banned", ip));
         }
     }
@@ -1547,8 +1552,8 @@ pub(crate) async fn handle_connection(
             Some(tls_pubkey) if tls_pubkey != remote_meta.public_key => {
                 let err_msg = "TLS certificate pubkey does not match meta handshake pubkey";
                 tracing::warn!("{} from {}", err_msg, uri);
-                if let Some(ip) = peer_ip {
-                    if !ip.is_loopback() { active.ban_list.record_failure(ip, err_msg).await; }
+                if let Some(ip) = bannable_ip {
+                    active.ban_list.record_failure(ip, err_msg).await;
                 }
                 return Err(err_msg.to_string());
             }
@@ -1577,9 +1582,11 @@ pub(crate) async fn handle_connection(
         // Log incompatible version
         if let Some(ip) = peer_ip {
             tracing::info!("Rejected connection from {}: {}", ip, err_msg);
-            if !ip.is_loopback() { active.ban_list.record_failure(ip, "incompatible version").await; }
         } else {
             tracing::info!("Rejected connection: {}", err_msg);
+        }
+        if let Some(ip) = bannable_ip {
+            active.ban_list.record_failure(ip, "incompatible version").await;
         }
 
         return Err(err_msg);
@@ -1617,7 +1624,9 @@ pub(crate) async fn handle_connection(
     if link_type == LinkType::Incoming && !core.is_key_allowed(&remote_meta.public_key) {
         if let Some(ip) = peer_ip {
             tracing::debug!("Rejected connection from {}: key not in allowed list", ip);
-            if !ip.is_loopback() { active.ban_list.record_failure(ip, "key not allowed").await; }
+        }
+        if let Some(ip) = bannable_ip {
+            active.ban_list.record_failure(ip, "key not allowed").await;
         }
         return Err("remote key not allowed".to_string());
     }
