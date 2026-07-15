@@ -315,16 +315,11 @@ pub(crate) async fn pt_socks5_connect(
 // ---------------------------------------------------------------------------
 
 /// Encode PT connection args as `key=val;key=val` with backslash-escaping
-/// of `\`, `;`, and `=` in values, suitable for the SOCKS5 username field.
+/// of `\`, `;`, and `=` in both keys and values (pt-spec §3.5), suitable
+/// for the SOCKS5 username field.
 pub(crate) fn encode_pt_args(args: &[(String, String)]) -> String {
-    let mut out = String::new();
-    for (i, (k, v)) in args.iter().enumerate() {
-        if i > 0 {
-            out.push(';');
-        }
-        out.push_str(k);
-        out.push('=');
-        for ch in v.chars() {
+    fn escape_into(s: &str, out: &mut String) {
+        for ch in s.chars() {
             match ch {
                 '\\' => out.push_str(r"\\"),
                 ';'  => out.push_str(r"\;"),
@@ -332,6 +327,16 @@ pub(crate) fn encode_pt_args(args: &[(String, String)]) -> String {
                 c    => out.push(c),
             }
         }
+    }
+
+    let mut out = String::new();
+    for (i, (k, v)) in args.iter().enumerate() {
+        if i > 0 {
+            out.push(';');
+        }
+        escape_into(k, &mut out);
+        out.push('=');
+        escape_into(v, &mut out);
     }
     out
 }
@@ -377,6 +382,16 @@ mod tests {
             ("a".to_string(), r"semi;equal=back\slash".to_string()),
         ];
         assert_eq!(encode_pt_args(&args), r"a=semi\;equal\=back\\slash");
+    }
+
+    #[test]
+    fn encode_pt_args_escapes_keys_too() {
+        // pt-spec §3.5 requires escaping in keys as well as values; an
+        // unescaped key would corrupt the whole arg string.
+        let args = vec![
+            (r"we;ird=k\ey".to_string(), "val".to_string()),
+        ];
+        assert_eq!(encode_pt_args(&args), r"we\;ird\=k\\ey=val");
     }
 
     #[test]
