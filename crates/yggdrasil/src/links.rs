@@ -178,6 +178,12 @@ const DEFAULT_BACKOFF_LIMIT: Duration = Duration::from_secs(4096);
 const MINIMUM_BACKOFF_LIMIT: Duration = Duration::from_secs(5);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(6);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+// Dialling through a Pluggable Transport is deliberately slow — obfuscation
+// handshakes and rendezvous (e.g. Snowflake) can take tens of seconds — so it
+// gets its own, much larger budget than a plain TCP connect. Without any cap a
+// blackholed bridge would wedge the reconnect loop forever.
+#[cfg(feature = "pt")]
+const PT_DIAL_TIMEOUT: Duration = Duration::from_secs(60);
 
 // Maximum shift for exponential backoff (dial wait = 1 << shift seconds),
 // further clamped by options.max_backoff.
@@ -1189,15 +1195,15 @@ impl Links {
                             Some(a) => a,
                             None => return Err("PT client not ready (process starting or crashed)".to_string()),
                         };
-                        return pt::pt_socks5_connect(socks_addr, &host, port, &pt_args)
-                            .await
-                            .map(|tcp| {
-                                let peer_addr: std::net::SocketAddr =
-                                    format!("{}:{}", host, port)
-                                        .parse()
-                                        .unwrap_or(socks_addr);
-                                Stream::Pt(tcp, peer_addr)
-                            });
+                        let tcp = tokio::time::timeout(
+                            PT_DIAL_TIMEOUT,
+                            pt::pt_socks5_connect(socks_addr, &host, port, &pt_args),
+                        )
+                        .await
+                        .map_err(|_| "PT dial timed out".to_string())??;
+                        let peer_addr: std::net::SocketAddr =
+                            format!("{}:{}", host, port).parse().unwrap_or(socks_addr);
+                        return Ok(Stream::Pt(tcp, peer_addr));
                     }
                     #[cfg(feature = "quic")]
                     if use_quic {
