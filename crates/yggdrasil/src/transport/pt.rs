@@ -162,6 +162,10 @@ pub(crate) async fn spawn_pt_server(
         .env("TOR_PT_SERVER_TRANSPORTS", &cfg.protocol)
         .env("TOR_PT_SERVER_BINDADDR", &bindaddr_env)
         .env("TOR_PT_ORPORT", orport_addr.to_string())
+        // pt-spec §3.2.3 requires the parent to set this for server PTs; the
+        // empty value means the Extended ORPort protocol (which would carry
+        // real client addresses via USERADDR) is not supported.
+        .env("TOR_PT_EXTENDED_SERVER_PORT", "")
         .env("TOR_PT_STATE_LOCATION", &cfg.workdir)
         // Exit when stdin closes so the public listener socket is released on
         // shutdown rather than being held by an orphaned child (which would
