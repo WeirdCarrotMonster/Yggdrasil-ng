@@ -1850,7 +1850,6 @@ fn is_valid_url_scheme(s: &str) -> bool {
 /// base64 cert values are preserved as `+`, not corrupted to spaces.
 #[cfg(feature = "pt")]
 fn extract_pt_args(url: &Url) -> Vec<(String, String)> {
-    const STANDARD_KEYS: &[&str] = &["key", "priority", "password", "maxbackoff", "sni"];
     let query = match url.query() {
         Some(q) => q,
         None => return Vec::new(),
@@ -1860,7 +1859,7 @@ fn extract_pt_args(url: &Url) -> Vec<(String, String)> {
             let (k, v) = pair.split_once('=')?;
             let key = pct_decode(k);
             let val = pct_decode(v);
-            if STANDARD_KEYS.contains(&key.as_str()) { None } else { Some((key, val)) }
+            if STANDARD_LINK_OPTION_KEYS.contains(&key.as_str()) { None } else { Some((key, val)) }
         })
         .collect()
 }
@@ -1888,10 +1887,19 @@ fn pct_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Query parameter names consumed by [`parse_link_options`]. Every *other*
+/// parameter on a PT peer URL is forwarded to the PT binary as a connection
+/// argument (see `extract_pt_args`) — so when adding a match arm to
+/// `parse_link_options`, add the key here too, or PT peers using it would
+/// hand it to the PT, which typically rejects unknown args.
+#[cfg_attr(not(feature = "pt"), allow(dead_code))]
+const STANDARD_LINK_OPTION_KEYS: &[&str] = &["key", "priority", "password", "maxbackoff", "sni"];
+
 fn parse_link_options(url: &Url) -> Result<LinkOptions, String> {
     let mut opts = LinkOptions::default();
 
     for (key, value) in url.query_pairs() {
+        // Keep STANDARD_LINK_OPTION_KEYS in sync with these arms.
         match key.as_ref() {
             "key" => {
                 let bytes =
