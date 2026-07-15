@@ -55,7 +55,7 @@ futures-util = { version = "0.3", optional = true }
 quinn = { version = "0.11", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 
 [features]
-default = ["ctl", "tun", "systemd", "ckr", "ws", "quic"]
+default = ["ctl", "tun", "systemd", "ckr", "ws", "quic", "pt"]
 ctl = []
 tun = ["dep:tun-rs"]
 ckr = ["dep:route_manager"]
@@ -64,6 +64,8 @@ systemd = ["dep:sd-notify"]
 # can drop either via --no-default-features with a hand-picked feature list.
 ws = ["dep:tokio-tungstenite", "dep:futures-util"]
 quic = ["dep:quinn"]
+# pt enables Tor Pluggable Transport support (no additional binary deps needed).
+pt = []
 
 [dependencies.ipnet]
 version = "2"
