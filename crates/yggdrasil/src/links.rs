@@ -37,11 +37,13 @@ pub(crate) enum Stream {
     #[cfg(feature = "quic")]
     Quic(quic::QuicStream),
     /// A plain TCP stream tunnelled through a Pluggable Transport SOCKS5 proxy.
-    /// The second field carries the logical peer address (host:port from the
-    /// peer URL) so the rest of the stack has a meaningful remote addr without
-    /// relying on the actual socket peer (which is the loopback SOCKS proxy).
+    /// The second field carries the logical peer address so the rest of the
+    /// stack has a meaningful remote addr without relying on the actual socket
+    /// peer (which is the loopback SOCKS proxy). `None` for hostname bridges:
+    /// the name is resolved inside the PT (resolving it locally would leak
+    /// DNS), so no honest address exists.
     #[cfg(feature = "pt")]
-    Pt(TcpStream, SocketAddr),
+    Pt(TcpStream, Option<SocketAddr>),
 }
 
 impl Stream {
@@ -55,7 +57,12 @@ impl Stream {
             #[cfg(feature = "quic")]
             Stream::Quic(s) => Ok(s.peer_addr()),
             #[cfg(feature = "pt")]
-            Stream::Pt(_, addr) => Ok(*addr),
+            Stream::Pt(_, addr) => addr.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    "PT bridge address is a hostname (resolved inside the PT)",
+                )
+            }),
         }
     }
 
@@ -981,7 +988,7 @@ impl Links {
                                         let _ = handle_connection(
                                             LinkType::Incoming,
                                             opts,
-                                            Stream::Pt(stream, remote),
+                                            Stream::Pt(stream, Some(remote)),
                                             &core,
                                             &active,
                                             &remote_str,
@@ -1264,8 +1271,12 @@ impl Links {
                         )
                         .await
                         .map_err(|_| "PT dial timed out".to_string())??;
-                        let peer_addr: std::net::SocketAddr =
-                            format!("{}:{}", host, port).parse().unwrap_or(socks_addr);
+                        // Report the bridge's address only when the URL carried an
+                        // IP literal. A hostname stays unresolved (see the DNS-leak
+                        // note above), and falling back to the socket's real peer
+                        // would misreport the loopback SOCKS proxy as the remote.
+                        let peer_addr: Option<std::net::SocketAddr> =
+                            format!("{}:{}", host, port).parse().ok();
                         return Ok(Stream::Pt(tcp, peer_addr));
                     }
                     #[cfg(feature = "quic")]
@@ -1585,7 +1596,11 @@ pub(crate) async fn handle_connection(
     } else {
         "outbound"
     };
-    let peer_addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+    // No socket address (e.g. a PT hostname bridge): fall back to the URI.
+    let peer_addr = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| uri.to_string());
     tracing::info!(
         "Connected {}: {} @ {} (v{}.{})",
         direction,
