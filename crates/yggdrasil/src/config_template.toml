@@ -149,7 +149,9 @@ allow_icmp_echo = true
 #   password, maxbackoff, sni) are forwarded to the PT as connection arguments.
 #
 # Server listen format:
-#   "obfs4://0.0.0.0:PORT"
+#   "obfs4://0.0.0.0:PORT?iat-mode=1"
+#   As with peers, non-standard query parameters are forwarded to the PT — here
+#   as server-side transport options (TOR_PT_SERVER_TRANSPORT_OPTIONS).
 #   On first run the PT binary generates a server certificate and prints it to
 #   its log / state dir. Clients need that cert value in their peer URL.
 #

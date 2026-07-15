@@ -903,6 +903,12 @@ impl Links {
 
             let connection_limiter = self.connection_limiter.clone();
 
+            // Non-standard query params on the listen URL are server-side
+            // transport options (e.g. obfs4's `iat-mode`), delivered via
+            // TOR_PT_SERVER_TRANSPORT_OPTIONS — mirroring the client side,
+            // where the same params become SOCKS5-carried PT args.
+            let pt_server_options = extract_pt_args(&url);
+
             // The PT binary is spawned (and respawned) inside the task, so a
             // failed *initial* spawn is retried with the same capped exponential
             // backoff as a crash — it used to make listen() fail permanently,
@@ -916,7 +922,7 @@ impl Links {
                         break;
                     }
 
-                    match pt::spawn_pt_server(&pt_cfg, bind_addr, orport_addr).await {
+                    match pt::spawn_pt_server(&pt_cfg, bind_addr, orport_addr, &pt_server_options).await {
                         Ok(mut pt_server) => {
                             tracing::info!(
                                 "PT '{}' listening on {} (ORPORT {})",
@@ -1867,9 +1873,10 @@ fn is_valid_url_scheme(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
-/// Parse link options from a URL's query parameters.
 /// Collect all query parameters that are NOT standard Yggdrasil link options.
-/// These are forwarded as PT connection arguments via the SOCKS5 username field.
+/// On a peer URL these become PT connection arguments delivered via the SOCKS5
+/// username field; on a PT listen URL they become server-side transport
+/// options delivered via `TOR_PT_SERVER_TRANSPORT_OPTIONS`.
 ///
 /// Uses raw percent-decoding (not form-encoding) so that `+` characters in
 /// base64 cert values are preserved as `+`, not corrupted to spaces.
@@ -1886,7 +1893,7 @@ fn extract_pt_args(url: &Url) -> Vec<(String, String)> {
                 // typo'd bridge line, and dropping it silently makes that
                 // miserable to debug.
                 if !pair.is_empty() {
-                    tracing::warn!("ignoring valueless query parameter '{}' on PT peer", pair);
+                    tracing::warn!("ignoring valueless query parameter '{}' in PT URL", pair);
                 }
                 return None;
             };
@@ -1933,6 +1940,7 @@ fn pct_decode(s: &str) -> String {
 #[cfg_attr(not(feature = "pt"), allow(dead_code))]
 const STANDARD_LINK_OPTION_KEYS: &[&str] = &["key", "priority", "password", "maxbackoff", "sni"];
 
+/// Parse link options from a URL's query parameters.
 fn parse_link_options(url: &Url) -> Result<LinkOptions, String> {
     let mut opts = LinkOptions::default();
 

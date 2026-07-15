@@ -145,14 +145,19 @@ pub(crate) struct PtServerProcess {
 ///
 /// * `bind_addr`  — public address the PT should listen on (from the listen URL)
 /// * `orport_addr` — loopback address where Yggdrasil accepts forwarded conns
+/// * `server_options` — per-transport options from the listen URL's query
+///   parameters (e.g. obfs4's `iat-mode`), passed via
+///   `TOR_PT_SERVER_TRANSPORT_OPTIONS`
 pub(crate) async fn spawn_pt_server(
     cfg: &PluggableTransportConfig,
     bind_addr: SocketAddr,
     orport_addr: SocketAddr,
+    server_options: &[(String, String)],
 ) -> Result<PtServerProcess, String> {
     let bindaddr_env = format!("{}-{}", cfg.protocol, bind_addr);
 
-    let mut child = Command::new(&cfg.binary)
+    let mut command = Command::new(&cfg.binary);
+    command
         .env("TOR_PT_MANAGED_TRANSPORT_VER", "1")
         .env("TOR_PT_SERVER_TRANSPORTS", &cfg.protocol)
         .env("TOR_PT_SERVER_BINDADDR", &bindaddr_env)
@@ -165,7 +170,14 @@ pub(crate) async fn spawn_pt_server(
         .kill_on_drop(true)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if !server_options.is_empty() {
+        command.env(
+            "TOR_PT_SERVER_TRANSPORT_OPTIONS",
+            encode_server_transport_options(&cfg.protocol, server_options),
+        );
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| format!("PT server '{}': spawn failed: {}", cfg.protocol, e))?;
 
@@ -402,6 +414,38 @@ pub(crate) fn encode_pt_args(args: &[(String, String)]) -> String {
     out
 }
 
+/// Encode server-side transport options for `TOR_PT_SERVER_TRANSPORT_OPTIONS`
+/// (pt-spec §3.2.3): a semicolon-separated list of `<transport>:<key>=<value>`
+/// entries, with `\`, `:`, and `;` backslash-escaped.
+pub(crate) fn encode_server_transport_options(
+    protocol: &str,
+    options: &[(String, String)],
+) -> String {
+    fn escape_into(s: &str, out: &mut String) {
+        for ch in s.chars() {
+            match ch {
+                '\\' => out.push_str(r"\\"),
+                ':'  => out.push_str(r"\:"),
+                ';'  => out.push_str(r"\;"),
+                c    => out.push(c),
+            }
+        }
+    }
+
+    let mut out = String::new();
+    for (i, (k, v)) in options.iter().enumerate() {
+        if i > 0 {
+            out.push(';');
+        }
+        escape_into(protocol, &mut out);
+        out.push(':');
+        escape_into(k, &mut out);
+        out.push('=');
+        escape_into(v, &mut out);
+    }
+    out
+}
+
 /// Split an encoded PT arg string into SOCKS5 username/password fields
 /// (RFC 1929, as used by pt-spec §3.5).
 ///
@@ -464,6 +508,34 @@ mod tests {
     fn encode_pt_args_single() {
         let args = vec![("key".to_string(), "val".to_string())];
         assert_eq!(encode_pt_args(&args), "key=val");
+    }
+
+    #[test]
+    fn encode_server_transport_options_basic() {
+        let opts = vec![
+            ("iat-mode".to_string(), "1".to_string()),
+            ("drain".to_string(), "yes".to_string()),
+        ];
+        assert_eq!(
+            encode_server_transport_options("obfs4", &opts),
+            "obfs4:iat-mode=1;obfs4:drain=yes"
+        );
+    }
+
+    #[test]
+    fn encode_server_transport_options_escaping() {
+        let opts = vec![
+            (r"k:ey".to_string(), r"semi;colon:back\slash".to_string()),
+        ];
+        assert_eq!(
+            encode_server_transport_options("obfs4", &opts),
+            r"obfs4:k\:ey=semi\;colon\:back\\slash"
+        );
+    }
+
+    #[test]
+    fn encode_server_transport_options_empty() {
+        assert_eq!(encode_server_transport_options("obfs4", &[]), "");
     }
 
     #[test]
