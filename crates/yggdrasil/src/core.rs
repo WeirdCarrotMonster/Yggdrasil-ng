@@ -300,6 +300,11 @@ impl Core {
     pub async fn start(self: &Arc<Self>) {
         let config = self.config.clone();
 
+        #[cfg(feature = "pt")]
+        if !config.pluggable_transports.is_empty() {
+            self.links.lock().await.load_pluggable_transports(&config.pluggable_transports);
+        }
+
         for addr in &config.listen {
             if let Err(e) = self.listen(addr).await {
                 tracing::error!("Failed to listen on {}: {}", addr, e);
