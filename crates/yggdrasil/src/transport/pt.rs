@@ -217,6 +217,14 @@ pub(crate) async fn spawn_pt_server(
     Ok(PtServerProcess { child, _stdin: stdin, bound_addr })
 }
 
+/// Gracefully shut down a PT server: close stdin, wait up to 5 s, then kill.
+pub(crate) async fn shutdown_pt_server(mut proc: PtServerProcess) {
+    drop(proc._stdin.take());
+    if timeout(Duration::from_secs(5), proc.child.wait()).await.is_err() {
+        let _ = proc.child.kill().await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SOCKS5 client with username/password sub-negotiation (RFC 1929)
 // ---------------------------------------------------------------------------

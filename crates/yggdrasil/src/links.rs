@@ -920,7 +920,11 @@ impl Links {
                 loop {
                     tokio::select! {
                         _ = cancel_clone.cancelled() => {
-                            drop(pt_server);
+                            // Close stdin and wait rather than dropping: a drop
+                            // SIGKILLs via kill_on_drop, and the PT was spawned
+                            // with TOR_PT_EXIT_ON_STDIN_CLOSE precisely so it can
+                            // exit cleanly (releasing its public listener socket).
+                            pt::shutdown_pt_server(pt_server).await;
                             break;
                         }
                         // The PT process exiting is otherwise invisible: the ORPORT
@@ -1392,9 +1396,24 @@ impl Links {
         if let Some(h) = self.rate_handle.take() {
             h.abort();
         }
+        // Cancel all listeners first so they shut down concurrently, then wait
+        // for each to finish. PT server listeners do a graceful PT shutdown on
+        // cancellation (close stdin, give the PT up to 5 s to exit — see
+        // shutdown_pt_server); aborting right after cancelling would drop the
+        // task before it could observe the cancellation, SIGKILLing the PT via
+        // kill_on_drop and making the graceful path dead code. Plain TCP/QUIC
+        // listeners exit their select loops immediately, so awaiting them is
+        // cheap. The timeout back-stops a wedged task: aborting it drops any
+        // Child, whose kill_on_drop reaps the process.
+        let mut listener_handles = Vec::new();
         for (_, (cancel, handle)) in self.listeners.drain() {
             cancel.cancel();
-            handle.abort();
+            listener_handles.push(handle);
+        }
+        for mut handle in listener_handles {
+            if tokio::time::timeout(Duration::from_secs(6), &mut handle).await.is_err() {
+                handle.abort();
+            }
         }
         for (_, entry) in self.peers.drain() {
             entry.cancel.cancel();
