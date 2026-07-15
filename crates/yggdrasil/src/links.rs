@@ -1116,26 +1116,40 @@ impl Links {
         let port = url.port_or_known_default().ok_or("missing port")?;
         let target = format!("{}:{}", host, port);
 
+        // PT peers connect through the SOCKS proxy, which resolves the hostname
+        // itself inside the obfuscated channel. Resolving here would leak a
+        // plaintext DNS query for the bridge hostname — a metadata leak in the
+        // censorship-circumvention setting PTs exist for — and the result is
+        // meaningless anyway, since the real connection never uses it.
+        #[cfg(feature = "pt")]
+        let resolve_for_dedup = !use_pt;
+        #[cfg(not(feature = "pt"))]
+        let resolve_for_dedup = true;
+
         // Attempt DNS resolution for duplicate detection.
         // If DNS fails (e.g. device is offline), skip the check and let the
         // reconnect loop retry DNS + connect with its own backoff.
-        let addr_key: Option<String> = match tokio::net::lookup_host(&target).await {
-            Ok(addrs) => {
-                let mut resolved: Vec<_> = addrs.collect();
-                resolved.sort();
+        let addr_key: Option<String> = if !resolve_for_dedup {
+            None
+        } else {
+            match tokio::net::lookup_host(&target).await {
+                Ok(addrs) => {
+                    let mut resolved: Vec<_> = addrs.collect();
+                    resolved.sort();
 
-                // Check if any resolved IP:port is already connected
-                for addr in &resolved {
-                    let ak = addr.to_string();
-                    if let Some(existing_uri) = self.peer_addrs.get(&ak) {
-                        return Err(format!("peer {} already connected as {} (resolves to same address {})", uri, existing_uri, ak));
+                    // Check if any resolved IP:port is already connected
+                    for addr in &resolved {
+                        let ak = addr.to_string();
+                        if let Some(existing_uri) = self.peer_addrs.get(&ak) {
+                            return Err(format!("peer {} already connected as {} (resolves to same address {})", uri, existing_uri, ak));
+                        }
                     }
+                    resolved.first().map(|a| a.to_string())
                 }
-                resolved.first().map(|a| a.to_string())
-            }
-            Err(e) => {
-                tracing::warn!("DNS lookup failed for {} ({}), skipping duplicate check — will retry in reconnect loop", target, e);
-                None
+                Err(e) => {
+                    tracing::warn!("DNS lookup failed for {} ({}), skipping duplicate check — will retry in reconnect loop", target, e);
+                    None
+                }
             }
         };
 
