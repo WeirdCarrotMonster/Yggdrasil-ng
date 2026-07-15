@@ -1396,56 +1396,65 @@ impl Links {
         if let Some(h) = self.rate_handle.take() {
             h.abort();
         }
-        // Cancel all listeners first so they shut down concurrently, then wait
-        // for each to finish. PT server listeners do a graceful PT shutdown on
-        // cancellation (close stdin, give the PT up to 5 s to exit — see
-        // shutdown_pt_server); aborting right after cancelling would drop the
-        // task before it could observe the cancellation, SIGKILLing the PT via
-        // kill_on_drop and making the graceful path dead code. Plain TCP/QUIC
-        // listeners exit their select loops immediately, so awaiting them is
-        // cheap. The timeout back-stops a wedged task: aborting it drops any
-        // Child, whose kill_on_drop reaps the process.
-        let mut listener_handles = Vec::new();
+        // Cancel listeners and PT client managers first, so every task begins
+        // its shutdown at the same time, and only then wait on them together
+        // (reap_tasks). Both kinds of task can own a PT child process spawned
+        // with TOR_PT_EXIT_ON_STDIN_CLOSE: on cancellation they close the PT's
+        // stdin and give it up to 5 s to exit (see shutdown_pt_client /
+        // shutdown_pt_server). Aborting immediately after cancelling would
+        // drop the task before it could observe the cancellation, SIGKILLing
+        // the PT via kill_on_drop and making the graceful path dead code.
+        // Plain TCP/QUIC listeners exit their select loops immediately, so
+        // awaiting them is cheap.
+        let mut handles = Vec::new();
         for (_, (cancel, handle)) in self.listeners.drain() {
             cancel.cancel();
-            listener_handles.push(handle);
+            handles.push(handle);
         }
-        for mut handle in listener_handles {
-            if tokio::time::timeout(Duration::from_secs(6), &mut handle).await.is_err() {
-                handle.abort();
+        // Without this the PT client managers keep running — and keep
+        // restarting crashed PTs — after the core has been closed.
+        #[cfg(feature = "pt")]
+        {
+            for (cancel, _) in &self.pt_client_tasks {
+                cancel.cancel();
             }
+            handles.extend(self.pt_client_tasks.drain(..).map(|(_, handle)| handle));
         }
+
         for (_, entry) in self.peers.drain() {
             entry.cancel.cancel();
             entry.handle.abort();
         }
         self.peer_addrs.clear();
 
-        // Tear down PT client managers. Without this they keep running — and
-        // keep restarting crashed PTs — after the core has been closed.
-        //
-        // Cancel everything first so all managers begin their graceful shutdown
-        // (close the PT's stdin, give it up to 5 s to exit — see
-        // shutdown_pt_client) concurrently, then wait for each to finish.
-        // Aborting immediately after cancelling would drop the manager future
-        // before it could observe the cancellation, SIGKILLing the PT via
-        // kill_on_drop and making the graceful path dead code. The timeout
-        // back-stops a wedged manager: aborting it drops the Child, whose
-        // kill_on_drop reaps the process. Total wall time stays ~6 s because
-        // the shutdowns run in parallel.
+        reap_tasks(handles).await;
+
         #[cfg(feature = "pt")]
         {
-            for (cancel, _) in &self.pt_client_tasks {
-                cancel.cancel();
-            }
-            for (_, mut handle) in self.pt_client_tasks.drain(..) {
-                if tokio::time::timeout(Duration::from_secs(6), &mut handle).await.is_err() {
-                    handle.abort();
-                }
-            }
             self.pt_configs.clear();
             self.pt_client_rxs.clear();
         }
+    }
+}
+
+/// Wait for already-cancelled tasks to finish, aborting any that takes longer
+/// than 6 s. The waits run concurrently (one waiter task each), so total wall
+/// time is bounded by the slowest task, not the sum. Aborting a wedged task
+/// drops its future — including any PT `Child` it owns, whose kill_on_drop
+/// then reaps the process.
+async fn reap_tasks(handles: Vec<JoinHandle<()>>) {
+    let waiters: Vec<_> = handles
+        .into_iter()
+        .map(|mut handle| {
+            tokio::spawn(async move {
+                if tokio::time::timeout(Duration::from_secs(6), &mut handle).await.is_err() {
+                    handle.abort();
+                }
+            })
+        })
+        .collect();
+    for waiter in waiters {
+        let _ = waiter.await;
     }
 }
 
