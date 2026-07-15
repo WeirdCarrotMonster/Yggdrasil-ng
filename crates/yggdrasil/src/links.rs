@@ -1900,14 +1900,19 @@ fn pct_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(hi) = std::str::from_utf8(&bytes[i+1..i+3]) {
-                if let Ok(b) = u8::from_str_radix(hi, 16) {
-                    out.push(b);
-                    i += 3;
-                    continue;
-                }
-            }
+        // Both chars must be hex digits — `u8::from_str_radix` would also
+        // accept a leading `+` (turning e.g. `%+5` into byte 0x05), which is
+        // not valid percent-encoding.
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            let hi = (bytes[i + 1] as char).to_digit(16).unwrap() as u8;
+            let lo = (bytes[i + 2] as char).to_digit(16).unwrap() as u8;
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
@@ -2058,5 +2063,27 @@ mod tests {
     fn test_parse_link_options_maxbackoff_too_small() {
         let url = Url::parse("tcp://example.com:12345?maxbackoff=3s").unwrap();
         assert!(parse_link_options(&url).is_err());
+    }
+
+    #[cfg(feature = "pt")]
+    #[test]
+    fn test_pct_decode_basic() {
+        assert_eq!(pct_decode("cert%3Dabc%2Fdef"), "cert=abc/def");
+        // `+` passes through untouched (raw percent-decoding, not form-encoding).
+        assert_eq!(pct_decode("a+b%2Bc"), "a+b+c");
+        // Lowercase hex digits work too.
+        assert_eq!(pct_decode("%2f"), "/");
+    }
+
+    #[cfg(feature = "pt")]
+    #[test]
+    fn test_pct_decode_invalid_sequences_left_literal() {
+        // A sign is not a hex digit: u8::from_str_radix would have accepted
+        // "%+5" as byte 0x05.
+        assert_eq!(pct_decode("%+5"), "%+5");
+        assert_eq!(pct_decode("%zz"), "%zz");
+        // Truncated escape at end of string.
+        assert_eq!(pct_decode("abc%4"), "abc%4");
+        assert_eq!(pct_decode("abc%"), "abc%");
     }
 }
