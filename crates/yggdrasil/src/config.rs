@@ -29,6 +29,21 @@ pub struct MulticastInterfaceConfig {
     pub password: String,
 }
 
+/// Configuration for a Tor Pluggable Transport binary.
+///
+/// `protocol` becomes the URL scheme in `peers` and `listen` entries.
+/// The PT binary manages its own keying material under `workdir`.
+#[cfg(feature = "pt")]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PluggableTransportConfig {
+    /// Transport protocol name, e.g. `"obfs4"`.  Also used as the URL scheme.
+    pub protocol: String,
+    /// Absolute path to the PT executable, e.g. `"/usr/bin/lyrebird"`.
+    pub binary: String,
+    /// State directory passed to the PT as `TOR_PT_STATE_LOCATION`.
+    pub workdir: String,
+}
+
 fn default_multicast_filter() -> String {
     "*".to_string()
 }
@@ -111,6 +126,12 @@ pub struct Config {
     /// from the per-peer/per-multicast `password`, which gates direct peering.
     #[serde(default)]
     pub group_password: String,
+
+    /// Pluggable Transport plugins. Each entry names a protocol and the binary
+    /// that handles it; peers/listeners reference protocols by URL scheme.
+    #[cfg(feature = "pt")]
+    #[serde(default, rename = "pluggable_transport")]
+    pub pluggable_transports: Vec<PluggableTransportConfig>,
 }
 
 /// Built-in stateful firewall configuration. Default-off; when enabled,
@@ -248,6 +269,8 @@ impl Default for Config {
             tunnel_routing: TunnelRoutingConfig::default(),
             firewall: FirewallConfig::default(),
             group_password: String::new(),
+            #[cfg(feature = "pt")]
+            pluggable_transports: Vec::new(),
         }
     }
 }
