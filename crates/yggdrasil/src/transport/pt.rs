@@ -8,9 +8,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStdin, Command};
 use tokio::time::timeout;
 use tracing::debug;
 
@@ -22,6 +22,13 @@ use crate::config::PluggableTransportConfig;
 
 pub(crate) struct PtClientProcess {
     pub child: Child,
+    /// Held open for the life of the process. The PT was started with
+    /// `TOR_PT_EXIT_ON_STDIN_CLOSE`, and tokio's `Child::wait()` drops
+    /// `child.stdin` — so if we left stdin inside `child`, the very first
+    /// `wait()` used to monitor the process would signal it to exit. Keeping
+    /// the handle here means `wait()` has nothing to close; dropping it (see
+    /// `shutdown_pt_client`) is what triggers a graceful shutdown.
+    _stdin: Option<ChildStdin>,
     pub socks_addr: SocketAddr,
 }
 
@@ -39,11 +46,15 @@ pub(crate) async fn spawn_pt_client(cfg: &PluggableTransportConfig) -> Result<Pt
         .kill_on_drop(true)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("PT client '{}': spawn failed: {}", cfg.protocol, e))?;
 
+    // Take stdin out of `child` so tokio's wait() can't close it (see
+    // PtClientProcess::_stdin), and grab stderr for logging.
+    let stdin = child.stdin.take();
     let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
     let mut lines = BufReader::new(stdout).lines();
     let protocol = cfg.protocol.clone();
 
@@ -79,16 +90,41 @@ pub(crate) async fn spawn_pt_client(cfg: &PluggableTransportConfig) -> Result<Pt
     .await
     .map_err(|_| format!("PT client '{}': timed out waiting for CMETHODS DONE", cfg.protocol))??;
 
-    // lines / BufReader dropped here; TcpStream now carries the SOCKS proxy
-    Ok(PtClientProcess { child, socks_addr })
+    // Keep draining PT output for the life of the process: dropping the stdout
+    // reader would SIGPIPE a PT that logs to stdout, and an undrained pipe would
+    // eventually block the PT once its buffer fills.
+    spawn_output_logger(lines, protocol.clone(), "stdout");
+    spawn_output_logger(BufReader::new(stderr).lines(), protocol, "stderr");
+
+    Ok(PtClientProcess { child, _stdin: stdin, socks_addr })
 }
 
 /// Gracefully shut down a PT client: close stdin, wait up to 5 s, then kill.
 pub(crate) async fn shutdown_pt_client(mut proc: PtClientProcess) {
-    drop(proc.child.stdin.take());
+    drop(proc._stdin.take());
     if timeout(Duration::from_secs(5), proc.child.wait()).await.is_err() {
         let _ = proc.child.kill().await;
     }
+}
+
+/// Continuously read newline-delimited PT output and forward each line to the
+/// tracing log at debug level.  Runs until the pipe closes (process exit).
+fn spawn_output_logger<R>(mut lines: tokio::io::Lines<R>, protocol: String, stream: &'static str)
+where
+    R: AsyncBufRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => debug!(pt = %protocol, stream, line = %line, "pt output"),
+                Ok(None) => break,
+                Err(e) => {
+                    debug!(pt = %protocol, stream, "pt output read error: {}", e);
+                    break;
+                }
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +133,10 @@ pub(crate) async fn shutdown_pt_client(mut proc: PtClientProcess) {
 
 pub(crate) struct PtServerProcess {
     pub child: Child,
+    /// Held open for the life of the process; see `PtClientProcess::_stdin`.
+    /// tokio's `Child::wait()` (used to detect PT crashes) drops `child.stdin`,
+    /// which under `TOR_PT_EXIT_ON_STDIN_CLOSE` would immediately kill the PT.
+    _stdin: Option<ChildStdin>,
     /// The public-facing address that the PT binary actually bound.
     pub bound_addr: SocketAddr,
 }
@@ -125,11 +165,15 @@ pub(crate) async fn spawn_pt_server(
         .kill_on_drop(true)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("PT server '{}': spawn failed: {}", cfg.protocol, e))?;
 
+    // Take stdin out of `child` so tokio's wait() can't close it (see
+    // PtServerProcess::_stdin), and grab stderr for logging.
+    let stdin = child.stdin.take();
     let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
     let mut lines = BufReader::new(stdout).lines();
     let protocol = cfg.protocol.clone();
 
@@ -166,7 +210,11 @@ pub(crate) async fn spawn_pt_server(
     .await
     .map_err(|_| format!("PT server '{}': timed out waiting for SMETHODS DONE", cfg.protocol))??;
 
-    Ok(PtServerProcess { child, bound_addr })
+    // Keep draining PT output for the life of the process (see spawn_pt_client).
+    spawn_output_logger(lines, protocol.clone(), "stdout");
+    spawn_output_logger(BufReader::new(stderr).lines(), protocol, "stderr");
+
+    Ok(PtServerProcess { child, _stdin: stdin, bound_addr })
 }
 
 // ---------------------------------------------------------------------------
