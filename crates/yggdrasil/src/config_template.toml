@@ -123,3 +123,44 @@ open_tcp = [22, 80, 443]
 open_udp = [53]
 # open_all_for = ["200:abcd:1234::/48"]   # trusted friend subnets
 allow_icmp_echo = true
+
+# Tor Pluggable Transport (PT) support — censorship circumvention via obfuscation.
+#
+# Each [[pluggable_transport]] section registers one PT binary for a named protocol.
+# The protocol name becomes the URL scheme used in `peers` and `listen` entries.
+# PT binaries generate and manage their own keying material on first run; the
+# `workdir` directory is where they store that state (TOR_PT_STATE_LOCATION).
+#
+# No Yggdrasil recompile is needed to add a new transport — just drop in a binary,
+# add a section here, and reference the protocol name in `peers` / `listen`.
+#
+# Supported PT binaries (examples):
+#   obfs4proxy / lyrebird: https://gitlab.com/yawning/obfs4
+#   Snowflake:             https://gitlab.com/thetorproject/snowflake
+#
+# Fields:
+#   protocol  - transport name; must match the URL scheme in peers/listen
+#   binary    - absolute path to the PT executable
+#   workdir   - directory for PT state (keys, certificates, etc.)
+#
+# Client peer format:
+#   "obfs4://HOST:PORT?cert=BASE64&iat-mode=0"
+#   All query parameters except the standard Yggdrasil ones (key, priority,
+#   password, maxbackoff, sni) are forwarded to the PT as connection arguments.
+#
+# Server listen format:
+#   "obfs4://0.0.0.0:PORT"
+#   On first run the PT binary generates a server certificate and prints it to
+#   its log / state dir. Clients need that cert value in their peer URL.
+#
+# Example — obfs4 via lyrebird:
+# [[pluggable_transport]]
+# protocol = "obfs4"
+# binary = "/usr/bin/lyrebird"
+# workdir = "/var/lib/yggdrasil/obfs4"
+#
+# Example — Snowflake client:
+# [[pluggable_transport]]
+# protocol = "snowflake"
+# binary = "/usr/bin/snowflake-client"
+# workdir = "/var/lib/yggdrasil/snowflake"
