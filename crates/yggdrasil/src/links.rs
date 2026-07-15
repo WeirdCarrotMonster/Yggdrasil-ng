@@ -24,6 +24,8 @@ use crate::version::Metadata;
 use crate::transport::quic;
 #[cfg(feature = "ws")]
 use crate::transport::ws;
+#[cfg(feature = "pt")]
+use crate::transport::pt;
 
 /// Enum to handle TCP, TLS, WebSocket and QUIC streams uniformly.
 pub(crate) enum Stream {
@@ -34,6 +36,12 @@ pub(crate) enum Stream {
     Ws(ws::WsStream),
     #[cfg(feature = "quic")]
     Quic(quic::QuicStream),
+    /// A plain TCP stream tunnelled through a Pluggable Transport SOCKS5 proxy.
+    /// The second field carries the logical peer address (host:port from the
+    /// peer URL) so the rest of the stack has a meaningful remote addr without
+    /// relying on the actual socket peer (which is the loopback SOCKS proxy).
+    #[cfg(feature = "pt")]
+    Pt(TcpStream, SocketAddr),
 }
 
 impl Stream {
@@ -46,6 +54,8 @@ impl Stream {
             Stream::Ws(s) => Ok(s.peer_addr()),
             #[cfg(feature = "quic")]
             Stream::Quic(s) => Ok(s.peer_addr()),
+            #[cfg(feature = "pt")]
+            Stream::Pt(_, addr) => Ok(*addr),
         }
     }
 
@@ -67,6 +77,8 @@ impl Stream {
             Stream::Ws(s) => s.peer_cert(),
             #[cfg(feature = "quic")]
             Stream::Quic(s) => s.peer_cert(),
+            #[cfg(feature = "pt")]
+            Stream::Pt(_, _) => None,
         }
     }
 }
@@ -85,6 +97,8 @@ impl AsyncRead for Stream {
             Stream::Ws(s) => Pin::new(s).poll_read(cx, buf),
             #[cfg(feature = "quic")]
             Stream::Quic(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "pt")]
+            Stream::Pt(s, _) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -103,6 +117,8 @@ impl AsyncWrite for Stream {
             Stream::Ws(s) => Pin::new(s).poll_write(cx, buf),
             #[cfg(feature = "quic")]
             Stream::Quic(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "pt")]
+            Stream::Pt(s, _) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -115,6 +131,8 @@ impl AsyncWrite for Stream {
             Stream::Ws(s) => Pin::new(s).poll_flush(cx),
             #[cfg(feature = "quic")]
             Stream::Quic(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "pt")]
+            Stream::Pt(s, _) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -127,6 +145,8 @@ impl AsyncWrite for Stream {
             Stream::Ws(s) => Pin::new(s).poll_shutdown(cx),
             #[cfg(feature = "quic")]
             Stream::Quic(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "pt")]
+            Stream::Pt(s, _) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
