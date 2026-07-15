@@ -953,8 +953,13 @@ impl Links {
             "quic" => {
                 return Err("quic support not compiled in (enable the `quic` feature)".to_string())
             }
+            #[cfg(feature = "pt")]
+            s if self.pt_configs.contains_key(s) => (false, false, false),
             _ => return Err(format!("unsupported scheme: {}", scheme)),
         };
+
+        #[cfg(feature = "pt")]
+        let use_pt = self.pt_configs.contains_key(scheme.as_str());
 
         let host = url.host_str().ok_or("missing host")?.to_string();
         // `port_or_known_default()` so `ws://host` / `wss://host` infer 80/443.
@@ -1012,6 +1017,19 @@ impl Links {
         // Initialize error entry for this peer
         peer_errors.lock().await.insert(uri.to_string(), None);
 
+        // PT: clone the watch receiver for this protocol and collect per-connection args.
+        #[cfg(feature = "pt")]
+        let pt_socks_rx = if use_pt {
+            match self.pt_client_rxs.get(scheme.as_str()) {
+                Some(rx) => rx.clone(),
+                None => return Err(format!("PT protocol '{}' has no watch receiver (internal error)", scheme)),
+            }
+        } else {
+            tokio::sync::watch::channel(None).1
+        };
+        #[cfg(feature = "pt")]
+        let pt_args = if use_pt { extract_pt_args(&url) } else { Vec::new() };
+
         let handle = tokio::spawn(async move {
             let mut backoff: u32 = 0;
             loop {
@@ -1019,18 +1037,35 @@ impl Links {
                     break;
                 }
 
-                // Dial according to scheme. tcp/tls/ws/wss go through dial_stream
-                // (TCP + optional TLS + optional WebSocket); quic uses its own
-                // UDP-based dialer.
-                #[cfg(feature = "quic")]
-                let dial_result: Result<Stream, String> = if use_quic {
-                    quic::quic_connect(
-                        &url,
-                        quic_client_config.clone().expect("quic client config"),
-                    )
-                    .await
-                    .map(Stream::Quic)
-                } else {
+                // Dial according to scheme. PT goes through the SOCKS5 proxy exposed
+                // by the PT client process; quic uses its own UDP dialer; everything
+                // else goes through dial_stream (TCP + optional TLS + optional WS).
+                let dial_result: Result<Stream, String> = async {
+                    #[cfg(feature = "pt")]
+                    if use_pt {
+                        let socks_addr = match *pt_socks_rx.borrow() {
+                            Some(a) => a,
+                            None => return Err("PT client not ready (process starting or crashed)".to_string()),
+                        };
+                        return pt::pt_socks5_connect(socks_addr, &host, port, &pt_args)
+                            .await
+                            .map(|tcp| {
+                                let peer_addr: std::net::SocketAddr =
+                                    format!("{}:{}", host, port)
+                                        .parse()
+                                        .unwrap_or(socks_addr);
+                                Stream::Pt(tcp, peer_addr)
+                            });
+                    }
+                    #[cfg(feature = "quic")]
+                    if use_quic {
+                        return quic::quic_connect(
+                            &url,
+                            quic_client_config.clone().expect("quic client config"),
+                        )
+                        .await
+                        .map(Stream::Quic);
+                    }
                     dial_stream(
                         &target,
                         &host,
@@ -1041,17 +1076,7 @@ impl Links {
                         use_ws,
                     )
                     .await
-                };
-                #[cfg(not(feature = "quic"))]
-                let dial_result: Result<Stream, String> = dial_stream(
-                    &target,
-                    &host,
-                    port,
-                    url.path(),
-                    options.tls_sni.as_deref(),
-                    tls_connector.as_ref(),
-                    use_ws,
-                )
+                }
                 .await;
 
                 match dial_result {
@@ -1528,6 +1553,51 @@ fn parse_duration_string(s: &str) -> Result<Duration, String> {
 }
 
 /// Parse link options from a URL's query parameters.
+/// Collect all query parameters that are NOT standard Yggdrasil link options.
+/// These are forwarded as PT connection arguments via the SOCKS5 username field.
+///
+/// Uses raw percent-decoding (not form-encoding) so that `+` characters in
+/// base64 cert values are preserved as `+`, not corrupted to spaces.
+#[cfg(feature = "pt")]
+fn extract_pt_args(url: &Url) -> Vec<(String, String)> {
+    const STANDARD_KEYS: &[&str] = &["key", "priority", "password", "maxbackoff", "sni"];
+    let query = match url.query() {
+        Some(q) => q,
+        None => return Vec::new(),
+    };
+    query.split('&')
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            let key = pct_decode(k);
+            let val = pct_decode(v);
+            if STANDARD_KEYS.contains(&key.as_str()) { None } else { Some((key, val)) }
+        })
+        .collect()
+}
+
+/// Percent-decode a URL component WITHOUT the form-encoding `+`→space
+/// substitution.  Used for PT args where `+` is a valid base64 character.
+#[cfg(feature = "pt")]
+fn pct_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hi) = std::str::from_utf8(&bytes[i+1..i+3]) {
+                if let Ok(b) = u8::from_str_radix(hi, 16) {
+                    out.push(b);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn parse_link_options(url: &Url) -> Result<LinkOptions, String> {
     let mut opts = LinkOptions::default();
 
