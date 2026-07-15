@@ -1311,6 +1311,21 @@ impl Links {
             entry.handle.abort();
         }
         self.peer_addrs.clear();
+
+        // Tear down PT client managers. Cancelling lets each manager gracefully
+        // close its PT's stdin (see shutdown_pt_client); aborting the handle and
+        // `kill_on_drop` on the Child back-stop that if it doesn't exit promptly.
+        // Without this the managers keep running — and keep restarting crashed
+        // PTs — after the core has been closed.
+        #[cfg(feature = "pt")]
+        {
+            for (cancel, handle) in self.pt_client_tasks.drain(..) {
+                cancel.cancel();
+                handle.abort();
+            }
+            self.pt_configs.clear();
+            self.pt_client_rxs.clear();
+        }
     }
 }
 
