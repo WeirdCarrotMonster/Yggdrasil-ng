@@ -853,6 +853,38 @@ impl Links {
                             drop(pt_server);
                             break;
                         }
+                        // The PT process exiting is otherwise invisible: the ORPORT
+                        // socket stays bound (Yggdrasil owns it), so accept() never
+                        // errors on a PT crash. Watch the child directly and restart
+                        // it with exponential backoff.
+                        _ = pt_server.child.wait() => {
+                            tracing::warn!("PT server '{}' process exited, restarting", pt_cfg.protocol);
+                            let mut restart_backoff: u32 = 0;
+                            loop {
+                                match pt::spawn_pt_server(&pt_cfg, bind_addr, orport_addr).await {
+                                    Ok(p) => {
+                                        tracing::info!(
+                                            "PT server '{}' restarted on {}",
+                                            pt_cfg.protocol, p.bound_addr
+                                        );
+                                        pt_server = p;
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "PT server '{}' restart failed: {}",
+                                            pt_cfg.protocol, e
+                                        );
+                                        if restart_backoff < 6 { restart_backoff += 1; }
+                                        let wait = Duration::from_secs(1u64 << restart_backoff);
+                                        tokio::select! {
+                                            _ = cancel_clone.cancelled() => return,
+                                            _ = tokio::time::sleep(wait) => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         result = orport_listener.accept() => {
                             match result {
                                 Ok((stream, remote)) => {
@@ -886,38 +918,6 @@ impl Links {
                                 Err(e) => {
                                     tracing::error!("PT ORPORT accept error: {}", e);
                                     tokio::time::sleep(Duration::from_millis(100)).await;
-                                }
-                            }
-                        }
-                    }
-
-                    // Non-blocking liveness check after every select! iteration.
-                    // ORPORT socket stays bound regardless, so accept() won't error
-                    // on PT crash — we must poll.
-                    if !pt::is_alive(&mut pt_server) {
-                        tracing::warn!("PT server '{}' process exited, restarting", pt_cfg.protocol);
-                        let mut restart_backoff: u32 = 0;
-                        loop {
-                            match pt::spawn_pt_server(&pt_cfg, bind_addr, orport_addr).await {
-                                Ok(p) => {
-                                    tracing::info!(
-                                        "PT server '{}' restarted on {}",
-                                        pt_cfg.protocol, p.bound_addr
-                                    );
-                                    pt_server = p;
-                                    break;
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        "PT server '{}' restart failed: {}",
-                                        pt_cfg.protocol, e
-                                    );
-                                    if restart_backoff < 6 { restart_backoff += 1; }
-                                    let wait = Duration::from_secs(1u64 << restart_backoff);
-                                    tokio::select! {
-                                        _ = cancel_clone.cancelled() => return,
-                                        _ = tokio::time::sleep(wait) => {}
-                                    }
                                 }
                             }
                         }

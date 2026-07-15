@@ -162,11 +162,6 @@ pub(crate) async fn spawn_pt_server(
     Ok(PtServerProcess { child, bound_addr })
 }
 
-/// Non-blocking liveness check.  Returns `false` once the child has exited.
-pub(crate) fn is_alive(proc: &mut PtServerProcess) -> bool {
-    matches!(proc.child.try_wait(), Ok(None))
-}
-
 // ---------------------------------------------------------------------------
 // SOCKS5 client with username/password sub-negotiation (RFC 1929)
 // ---------------------------------------------------------------------------
