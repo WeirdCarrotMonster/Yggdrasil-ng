@@ -33,6 +33,9 @@ pub(crate) async fn spawn_pt_client(cfg: &PluggableTransportConfig) -> Result<Pt
         .env("TOR_PT_MANAGED_TRANSPORT_VER", "1")
         .env("TOR_PT_CLIENT_TRANSPORTS", &cfg.protocol)
         .env("TOR_PT_STATE_LOCATION", &cfg.workdir)
+        // Ask the PT to exit when its stdin closes so a graceful shutdown (or an
+        // abnormal exit that still runs destructors) doesn't orphan the child.
+        .env("TOR_PT_EXIT_ON_STDIN_CLOSE", "1")
         .kill_on_drop(true)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -115,6 +118,10 @@ pub(crate) async fn spawn_pt_server(
         .env("TOR_PT_SERVER_BINDADDR", &bindaddr_env)
         .env("TOR_PT_ORPORT", orport_addr.to_string())
         .env("TOR_PT_STATE_LOCATION", &cfg.workdir)
+        // Exit when stdin closes so the public listener socket is released on
+        // shutdown rather than being held by an orphaned child (which would
+        // then block a restarted PT from re-binding the same address).
+        .env("TOR_PT_EXIT_ON_STDIN_CLOSE", "1")
         .kill_on_drop(true)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
