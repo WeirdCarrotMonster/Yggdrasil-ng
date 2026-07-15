@@ -1072,9 +1072,9 @@ pub(crate) async fn handle_connection(
         Err(_) => None,
     };
 
-    // Check if IP is banned
+    // Check if IP is banned (loopback is never banned: PT server connections arrive from 127.0.0.1)
     if let Some(ip) = peer_ip {
-        if active.ban_list.is_banned(ip).await {
+        if !ip.is_loopback() && active.ban_list.is_banned(ip).await {
             return Err(format!("IP {} is temporarily banned", ip));
         }
     }
@@ -1141,7 +1141,7 @@ pub(crate) async fn handle_connection(
                 let err_msg = "TLS certificate pubkey does not match meta handshake pubkey";
                 tracing::warn!("{} from {}", err_msg, uri);
                 if let Some(ip) = peer_ip {
-                    active.ban_list.record_failure(ip, err_msg).await;
+                    if !ip.is_loopback() { active.ban_list.record_failure(ip, err_msg).await; }
                 }
                 return Err(err_msg.to_string());
             }
@@ -1170,8 +1170,7 @@ pub(crate) async fn handle_connection(
         // Log incompatible version
         if let Some(ip) = peer_ip {
             tracing::info!("Rejected connection from {}: {}", ip, err_msg);
-            // Record failure and potentially ban this IP
-            active.ban_list.record_failure(ip, "incompatible version").await;
+            if !ip.is_loopback() { active.ban_list.record_failure(ip, "incompatible version").await; }
         } else {
             tracing::info!("Rejected connection: {}", err_msg);
         }
@@ -1211,8 +1210,7 @@ pub(crate) async fn handle_connection(
     if link_type == LinkType::Incoming && !core.is_key_allowed(&remote_meta.public_key) {
         if let Some(ip) = peer_ip {
             tracing::debug!("Rejected connection from {}: key not in allowed list", ip);
-            // Record failure for unauthorized keys
-            active.ban_list.record_failure(ip, "key not allowed").await;
+            if !ip.is_loopback() { active.ban_list.record_failure(ip, "key not allowed").await; }
         }
         return Err("remote key not allowed".to_string());
     }
