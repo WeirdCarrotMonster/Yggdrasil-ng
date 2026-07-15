@@ -909,6 +909,8 @@ impl Links {
             let connection_limiter = self.connection_limiter.clone();
 
             let handle = tokio::spawn(async move {
+                let mut restart_backoff: u32 = 0;
+                let mut started = Instant::now();
                 loop {
                     tokio::select! {
                         _ = cancel_clone.cancelled() => {
@@ -921,8 +923,23 @@ impl Links {
                         // it with exponential backoff.
                         _ = pt_server.child.wait() => {
                             tracing::warn!("PT server '{}' process exited, restarting", pt_cfg.protocol);
-                            let mut restart_backoff: u32 = 0;
+                            // Backoff applies to a spawn that *succeeds* but dies
+                            // young too, not just to spawn failures — otherwise a PT
+                            // that reports SMETHODS DONE and then exits (bad state
+                            // dir, stolen port, ...) would restart in a tight loop.
+                            // Same policy as the client manager above.
+                            if started.elapsed() >= BACKOFF_RESET_UPTIME {
+                                restart_backoff = 0;
+                            } else if restart_backoff < 6 {
+                                restart_backoff += 1;
+                            }
                             loop {
+                                let wait = Duration::from_secs(1u64 << restart_backoff);
+                                tracing::debug!("PT server '{}' restarting in {:?}", pt_cfg.protocol, wait);
+                                tokio::select! {
+                                    _ = cancel_clone.cancelled() => return,
+                                    _ = tokio::time::sleep(wait) => {}
+                                }
                                 match pt::spawn_pt_server(&pt_cfg, bind_addr, orport_addr).await {
                                     Ok(p) => {
                                         tracing::info!(
@@ -930,6 +947,7 @@ impl Links {
                                             pt_cfg.protocol, p.bound_addr
                                         );
                                         pt_server = p;
+                                        started = Instant::now();
                                         break;
                                     }
                                     Err(e) => {
@@ -938,11 +956,6 @@ impl Links {
                                             pt_cfg.protocol, e
                                         );
                                         if restart_backoff < 6 { restart_backoff += 1; }
-                                        let wait = Duration::from_secs(1u64 << restart_backoff);
-                                        tokio::select! {
-                                            _ = cancel_clone.cancelled() => return,
-                                            _ = tokio::time::sleep(wait) => {}
-                                        }
                                     }
                                 }
                             }
