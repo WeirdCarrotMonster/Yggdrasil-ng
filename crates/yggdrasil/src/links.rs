@@ -599,6 +599,17 @@ pub struct Links {
     connection_limiter: Arc<Semaphore>,
     /// Last error per configured peer URI (shared with reconnect tasks).
     peer_errors: Arc<Mutex<HashMap<String, Option<String>>>>,
+
+    /// PT protocol name → config (used when routing peer/listen schemes).
+    #[cfg(feature = "pt")]
+    pt_configs: HashMap<String, crate::config::PluggableTransportConfig>,
+    /// PT protocol name → watch receiver broadcasting the current SOCKS5 proxy addr.
+    /// `None` means the PT client process is not yet ready or has crashed.
+    #[cfg(feature = "pt")]
+    pt_client_rxs: HashMap<String, tokio::sync::watch::Receiver<Option<std::net::SocketAddr>>>,
+    /// Manager task handles — kept alive for the lifetime of Links.
+    #[cfg(feature = "pt")]
+    pt_client_tasks: Vec<(CancellationToken, JoinHandle<()>)>,
 }
 
 impl Links {
@@ -613,6 +624,12 @@ impl Links {
             retry_notify: Arc::new(Notify::new()),
             connection_limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_INCOMING)),
             peer_errors: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "pt")]
+            pt_configs: HashMap::new(),
+            #[cfg(feature = "pt")]
+            pt_client_rxs: HashMap::new(),
+            #[cfg(feature = "pt")]
+            pt_client_tasks: Vec::new(),
         }
     }
 
@@ -657,6 +674,79 @@ impl Links {
 
     fn core(&self) -> Result<Arc<Core>, String> {
         self.core.clone().ok_or_else(|| "core not initialized".to_string())
+    }
+
+    /// Register Pluggable Transport configs and start one manager task per protocol.
+    ///
+    /// Each manager task owns the PT child process, restarts it on crash with
+    /// exponential backoff, and broadcasts the current SOCKS5 proxy address via
+    /// a watch channel.  Peer reconnect tasks clone the receiver and check it
+    /// before dialling — `None` means the PT is not yet ready.
+    #[cfg(feature = "pt")]
+    pub fn load_pluggable_transports(
+        &mut self,
+        configs: &[crate::config::PluggableTransportConfig],
+    ) {
+        for cfg in configs {
+            if self.pt_configs.contains_key(&cfg.protocol) {
+                tracing::warn!("PT protocol '{}' configured more than once, ignoring duplicate", cfg.protocol);
+                continue;
+            }
+            self.pt_configs.insert(cfg.protocol.clone(), cfg.clone());
+
+            let (tx, rx) = tokio::sync::watch::channel::<Option<std::net::SocketAddr>>(None);
+            self.pt_client_rxs.insert(cfg.protocol.clone(), rx);
+
+            let cfg = cfg.clone();
+            let cancel = CancellationToken::new();
+            let handle = tokio::spawn({
+                let cancel = cancel.clone();
+                async move {
+                    let mut backoff: u32 = 0;
+                    loop {
+                        if cancel.is_cancelled() { break; }
+
+                        match pt::spawn_pt_client(&cfg).await {
+                            Ok(mut proc) => {
+                                let _ = tx.send(Some(proc.socks_addr));
+                                tracing::info!(
+                                    "PT client '{}' ready on {}",
+                                    cfg.protocol, proc.socks_addr
+                                );
+                                backoff = 0;
+                                tokio::select! {
+                                    _ = cancel.cancelled() => {
+                                        pt::shutdown_pt_client(proc).await;
+                                        break;
+                                    }
+                                    _ = proc.child.wait() => {
+                                        let _ = tx.send(None);
+                                        tracing::warn!(
+                                            "PT client '{}' exited unexpectedly, restarting",
+                                            cfg.protocol
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(None);
+                                tracing::error!("PT client '{}' failed to start: {}", cfg.protocol, e);
+                                if backoff < 6 { backoff += 1; }
+                            }
+                        }
+
+                        let wait = Duration::from_secs(1u64 << backoff);
+                        tracing::debug!("PT client '{}' retrying in {:?}", cfg.protocol, wait);
+                        tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            _ = tokio::time::sleep(wait) => {}
+                        }
+                    }
+                    tracing::debug!("PT client manager '{}' stopped", cfg.protocol);
+                }
+            });
+            self.pt_client_tasks.push((cancel, handle));
+        }
     }
 
     /// Start listening on an address (e.g. "tcp://0.0.0.0:1234", "tls://0.0.0.0:2345",
