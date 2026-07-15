@@ -1391,16 +1391,27 @@ impl Links {
         }
         self.peer_addrs.clear();
 
-        // Tear down PT client managers. Cancelling lets each manager gracefully
-        // close its PT's stdin (see shutdown_pt_client); aborting the handle and
-        // `kill_on_drop` on the Child back-stop that if it doesn't exit promptly.
-        // Without this the managers keep running — and keep restarting crashed
-        // PTs — after the core has been closed.
+        // Tear down PT client managers. Without this they keep running — and
+        // keep restarting crashed PTs — after the core has been closed.
+        //
+        // Cancel everything first so all managers begin their graceful shutdown
+        // (close the PT's stdin, give it up to 5 s to exit — see
+        // shutdown_pt_client) concurrently, then wait for each to finish.
+        // Aborting immediately after cancelling would drop the manager future
+        // before it could observe the cancellation, SIGKILLing the PT via
+        // kill_on_drop and making the graceful path dead code. The timeout
+        // back-stops a wedged manager: aborting it drops the Child, whose
+        // kill_on_drop reaps the process. Total wall time stays ~6 s because
+        // the shutdowns run in parallel.
         #[cfg(feature = "pt")]
         {
-            for (cancel, handle) in self.pt_client_tasks.drain(..) {
+            for (cancel, _) in &self.pt_client_tasks {
                 cancel.cancel();
-                handle.abort();
+            }
+            for (_, mut handle) in self.pt_client_tasks.drain(..) {
+                if tokio::time::timeout(Duration::from_secs(6), &mut handle).await.is_err() {
+                    handle.abort();
+                }
             }
             self.pt_configs.clear();
             self.pt_client_rxs.clear();
