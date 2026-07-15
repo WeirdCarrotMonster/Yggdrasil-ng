@@ -239,36 +239,51 @@ pub(crate) async fn pt_socks5_connect(
     // held back behind small writes.
     stream.set_nodelay(true).ok();
 
-    // --- Greeting: request method 0x02 (username/password) ---
-    stream.write_all(&[0x05, 0x01, 0x02]).await
+    // --- Greeting ---
+    // Username/password (0x02) is how PT args are delivered (pt-spec §3.5).
+    // With no args to deliver, also offer no-auth (0x00) — like Tor does —
+    // for PT SOCKS servers that skip auth when they need no arguments.
+    let encoded_args = encode_pt_args(pt_args);
+    let greeting: &[u8] = if encoded_args.is_empty() {
+        &[0x05, 0x02, 0x00, 0x02]
+    } else {
+        &[0x05, 0x01, 0x02]
+    };
+    stream.write_all(greeting).await
         .map_err(|e| format!("SOCKS5 greeting write: {}", e))?;
 
     let mut resp = [0u8; 2];
     stream.read_exact(&mut resp).await
         .map_err(|e| format!("SOCKS5 greeting read: {}", e))?;
-    if resp[0] != 0x05 || resp[1] != 0x02 {
-        return Err(format!("SOCKS5: server chose method 0x{:02x}, expected 0x02", resp[1]));
+    if resp[0] != 0x05 {
+        return Err(format!("SOCKS5: bad greeting version 0x{:02x}", resp[0]));
     }
+    match resp[1] {
+        // No-auth chosen (only offered when there are no args): skip sub-negotiation.
+        0x00 if encoded_args.is_empty() => {}
+        0x02 => {
+            // --- Sub-negotiation (RFC 1929) ---
+            // PT args ride in the username field; if they overflow 255 bytes the
+            // remainder spills into the password field (pt-spec §3.5).
+            let (username_bytes, password_bytes) = split_socks5_auth(&encoded_args)?;
 
-    // --- Sub-negotiation (RFC 1929) ---
-    // PT args ride in the username field; if they overflow 255 bytes the
-    // remainder spills into the password field (pt-spec §3.5).
-    let (username_bytes, password_bytes) = split_socks5_auth(&encode_pt_args(pt_args))?;
+            let mut subneg = Vec::with_capacity(3 + username_bytes.len() + password_bytes.len());
+            subneg.push(0x01);
+            subneg.push(username_bytes.len() as u8);
+            subneg.extend_from_slice(&username_bytes);
+            subneg.push(password_bytes.len() as u8);
+            subneg.extend_from_slice(&password_bytes);
+            stream.write_all(&subneg).await
+                .map_err(|e| format!("SOCKS5 sub-neg write: {}", e))?;
 
-    let mut subneg = Vec::with_capacity(3 + username_bytes.len() + password_bytes.len());
-    subneg.push(0x01);
-    subneg.push(username_bytes.len() as u8);
-    subneg.extend_from_slice(&username_bytes);
-    subneg.push(password_bytes.len() as u8);
-    subneg.extend_from_slice(&password_bytes);
-    stream.write_all(&subneg).await
-        .map_err(|e| format!("SOCKS5 sub-neg write: {}", e))?;
-
-    let mut auth_resp = [0u8; 2];
-    stream.read_exact(&mut auth_resp).await
-        .map_err(|e| format!("SOCKS5 sub-neg read: {}", e))?;
-    if auth_resp[1] != 0x00 {
-        return Err(format!("SOCKS5 sub-neg rejected (status 0x{:02x})", auth_resp[1]));
+            let mut auth_resp = [0u8; 2];
+            stream.read_exact(&mut auth_resp).await
+                .map_err(|e| format!("SOCKS5 sub-neg read: {}", e))?;
+            if auth_resp[1] != 0x00 {
+                return Err(format!("SOCKS5 sub-neg rejected (status 0x{:02x})", auth_resp[1]));
+            }
+        }
+        m => return Err(format!("SOCKS5: server chose unsupported method 0x{:02x}", m)),
     }
 
     // --- CONNECT request (ATYPE 0x03 = domain name) ---
