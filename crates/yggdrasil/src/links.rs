@@ -1884,7 +1884,15 @@ fn extract_pt_args(url: &Url) -> Vec<(String, String)> {
     };
     query.split('&')
         .filter_map(|pair| {
-            let (k, v) = pair.split_once('=')?;
+            let Some((k, v)) = pair.split_once('=') else {
+                // PT args are always key=value; a bare key is most likely a
+                // typo'd bridge line, and dropping it silently makes that
+                // miserable to debug.
+                if !pair.is_empty() {
+                    tracing::warn!("ignoring valueless query parameter '{}' on PT peer", pair);
+                }
+                return None;
+            };
             let key = pct_decode(k);
             let val = pct_decode(v);
             if STANDARD_LINK_OPTION_KEYS.contains(&key.as_str()) { None } else { Some((key, val)) }
@@ -2063,6 +2071,22 @@ mod tests {
     fn test_parse_link_options_maxbackoff_too_small() {
         let url = Url::parse("tcp://example.com:12345?maxbackoff=3s").unwrap();
         assert!(parse_link_options(&url).is_err());
+    }
+
+    #[cfg(feature = "pt")]
+    #[test]
+    fn test_extract_pt_args() {
+        let url = Url::parse("obfs4://192.0.2.1:443?cert=abc&key=0011&iat-mode=0&flag").unwrap();
+        let args = extract_pt_args(&url);
+        // Standard link options (key) are consumed by parse_link_options, and
+        // the valueless `flag` is dropped (with a warning); the rest go to the PT.
+        assert_eq!(
+            args,
+            vec![
+                ("cert".to_string(), "abc".to_string()),
+                ("iat-mode".to_string(), "0".to_string()),
+            ]
+        );
     }
 
     #[cfg(feature = "pt")]
