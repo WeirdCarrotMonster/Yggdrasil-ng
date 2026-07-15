@@ -682,12 +682,13 @@ impl Links {
         self.core.clone().ok_or_else(|| "core not initialized".to_string())
     }
 
-    /// Register Pluggable Transport configs and start one manager task per protocol.
+    /// Register Pluggable Transport configs so peers/listeners can reference
+    /// them by URL scheme.
     ///
-    /// Each manager task owns the PT child process, restarts it on crash with
-    /// exponential backoff, and broadcasts the current SOCKS5 proxy address via
-    /// a watch channel.  Peer reconnect tasks clone the receiver and check it
-    /// before dialling — `None` means the PT is not yet ready.
+    /// This only records the configs; the client subprocess for a protocol is
+    /// started lazily by [`ensure_pt_client`](Self::ensure_pt_client) the first
+    /// time a peer actually uses that scheme, so a bridge-server-only node never
+    /// runs an idle PT client. Server-side PTs are spawned by `listen()`.
     #[cfg(feature = "pt")]
     pub fn load_pluggable_transports(
         &mut self,
@@ -720,69 +721,88 @@ impl Links {
             }
             let mut cfg = cfg.clone();
             cfg.protocol = protocol.clone();
-            self.pt_configs.insert(protocol.clone(), cfg.clone());
+            self.pt_configs.insert(protocol, cfg);
+        }
+    }
 
-            let (tx, rx) = tokio::sync::watch::channel::<Option<std::net::SocketAddr>>(None);
-            self.pt_client_rxs.insert(protocol.clone(), rx);
+    /// Ensure a PT client manager is running for `protocol`, starting it on
+    /// first use. Idempotent: a second call for the same protocol is a no-op.
+    ///
+    /// The manager task owns the PT child process, restarts it on crash with
+    /// exponential backoff, and broadcasts the current SOCKS5 proxy address via
+    /// a watch channel. Peer reconnect tasks clone the receiver and check it
+    /// before dialling — `None` means the PT is not yet ready.
+    #[cfg(feature = "pt")]
+    fn ensure_pt_client(&mut self, protocol: &str) {
+        // A receiver already exists → the manager is running for this protocol.
+        if self.pt_client_rxs.contains_key(protocol) {
+            return;
+        }
+        let cfg = match self.pt_configs.get(protocol) {
+            Some(cfg) => cfg.clone(),
+            None => return, // not a registered PT scheme; callers guard this
+        };
 
-            let cancel = CancellationToken::new();
-            let handle = tokio::spawn({
-                let cancel = cancel.clone();
-                async move {
-                    let mut backoff: u32 = 0;
-                    loop {
-                        if cancel.is_cancelled() { break; }
+        let (tx, rx) = tokio::sync::watch::channel::<Option<std::net::SocketAddr>>(None);
+        self.pt_client_rxs.insert(protocol.to_string(), rx);
 
-                        match pt::spawn_pt_client(&cfg).await {
-                            Ok(mut proc) => {
-                                let _ = tx.send(Some(proc.socks_addr));
-                                tracing::info!(
-                                    "PT client '{}' ready on {}",
-                                    cfg.protocol, proc.socks_addr
-                                );
-                                let started = Instant::now();
-                                tokio::select! {
-                                    _ = cancel.cancelled() => {
-                                        pt::shutdown_pt_client(proc).await;
-                                        break;
-                                    }
-                                    _ = proc.child.wait() => {
-                                        let _ = tx.send(None);
-                                        tracing::warn!(
-                                            "PT client '{}' exited unexpectedly, restarting",
-                                            cfg.protocol
-                                        );
-                                        // Only clear backoff if the process stayed up
-                                        // long enough to be considered healthy;
-                                        // otherwise a fast crash-loop would retry every
-                                        // second forever.
-                                        if started.elapsed() >= BACKOFF_RESET_UPTIME {
-                                            backoff = 0;
-                                        } else if backoff < 6 {
-                                            backoff += 1;
-                                        }
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                let mut backoff: u32 = 0;
+                loop {
+                    if cancel.is_cancelled() { break; }
+
+                    match pt::spawn_pt_client(&cfg).await {
+                        Ok(mut proc) => {
+                            let _ = tx.send(Some(proc.socks_addr));
+                            tracing::info!(
+                                "PT client '{}' ready on {}",
+                                cfg.protocol, proc.socks_addr
+                            );
+                            let started = Instant::now();
+                            tokio::select! {
+                                _ = cancel.cancelled() => {
+                                    pt::shutdown_pt_client(proc).await;
+                                    break;
+                                }
+                                _ = proc.child.wait() => {
+                                    let _ = tx.send(None);
+                                    tracing::warn!(
+                                        "PT client '{}' exited unexpectedly, restarting",
+                                        cfg.protocol
+                                    );
+                                    // Only clear backoff if the process stayed up
+                                    // long enough to be considered healthy;
+                                    // otherwise a fast crash-loop would retry every
+                                    // second forever.
+                                    if started.elapsed() >= BACKOFF_RESET_UPTIME {
+                                        backoff = 0;
+                                    } else if backoff < 6 {
+                                        backoff += 1;
                                     }
                                 }
                             }
-                            Err(e) => {
-                                let _ = tx.send(None);
-                                tracing::error!("PT client '{}' failed to start: {}", cfg.protocol, e);
-                                if backoff < 6 { backoff += 1; }
-                            }
                         }
-
-                        let wait = Duration::from_secs(1u64 << backoff);
-                        tracing::debug!("PT client '{}' retrying in {:?}", cfg.protocol, wait);
-                        tokio::select! {
-                            _ = cancel.cancelled() => break,
-                            _ = tokio::time::sleep(wait) => {}
+                        Err(e) => {
+                            let _ = tx.send(None);
+                            tracing::error!("PT client '{}' failed to start: {}", cfg.protocol, e);
+                            if backoff < 6 { backoff += 1; }
                         }
                     }
-                    tracing::debug!("PT client manager '{}' stopped", cfg.protocol);
+
+                    let wait = Duration::from_secs(1u64 << backoff);
+                    tracing::debug!("PT client '{}' retrying in {:?}", cfg.protocol, wait);
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = tokio::time::sleep(wait) => {}
+                    }
                 }
-            });
-            self.pt_client_tasks.push((cancel, handle));
-        }
+                tracing::debug!("PT client manager '{}' stopped", cfg.protocol);
+            }
+        });
+        self.pt_client_tasks.push((cancel, handle));
     }
 
     /// Start listening on an address (e.g. "tcp://0.0.0.0:1234", "tls://0.0.0.0:2345",
@@ -1108,6 +1128,11 @@ impl Links {
 
         #[cfg(feature = "pt")]
         let use_pt = self.pt_configs.contains_key(scheme.as_str());
+        // Start the PT client subprocess on first use of this scheme.
+        #[cfg(feature = "pt")]
+        if use_pt {
+            self.ensure_pt_client(&scheme);
+        }
 
         let host = url.host_str().ok_or("missing host")?.to_string();
         // `port_or_known_default()` so `ws://host` / `wss://host` infer 80/443.
