@@ -9,3 +9,6 @@ pub(crate) mod quic;
 
 #[cfg(feature = "ws")]
 pub(crate) mod ws;
+
+#[cfg(feature = "pt")]
+pub(crate) mod pt;
