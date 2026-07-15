@@ -901,113 +901,110 @@ impl Links {
                 .local_addr()
                 .map_err(|e| format!("PT ORPORT local_addr: {}", e))?;
 
-            let mut pt_server = pt::spawn_pt_server(&pt_cfg, bind_addr, orport_addr)
-                .await
-                .map_err(|e| {
-                    tracing::error!("PT server '{}' failed to start: {}", pt_cfg.protocol, e);
-                    e
-                })?;
-            tracing::info!(
-                "PT '{}' listening on {} (ORPORT {})",
-                pt_cfg.protocol, pt_server.bound_addr, orport_addr
-            );
-
             let connection_limiter = self.connection_limiter.clone();
 
+            // The PT binary is spawned (and respawned) inside the task, so a
+            // failed *initial* spawn is retried with the same capped exponential
+            // backoff as a crash — it used to make listen() fail permanently,
+            // unlike PT clients, whose manager retries forever. The cost is that
+            // a bad config (e.g. a typo'd binary path) surfaces in the log
+            // rather than as a listen() error.
             let handle = tokio::spawn(async move {
-                let mut restart_backoff: u32 = 0;
-                let mut started = Instant::now();
+                let mut backoff: u32 = 0;
                 loop {
-                    tokio::select! {
-                        _ = cancel_clone.cancelled() => {
-                            // Close stdin and wait rather than dropping: a drop
-                            // SIGKILLs via kill_on_drop, and the PT was spawned
-                            // with TOR_PT_EXIT_ON_STDIN_CLOSE precisely so it can
-                            // exit cleanly (releasing its public listener socket).
-                            pt::shutdown_pt_server(pt_server).await;
-                            break;
-                        }
-                        // The PT process exiting is otherwise invisible: the ORPORT
-                        // socket stays bound (Yggdrasil owns it), so accept() never
-                        // errors on a PT crash. Watch the child directly and restart
-                        // it with exponential backoff.
-                        _ = pt_server.child.wait() => {
-                            tracing::warn!("PT server '{}' process exited, restarting", pt_cfg.protocol);
-                            // Backoff applies to a spawn that *succeeds* but dies
-                            // young too, not just to spawn failures — otherwise a PT
-                            // that reports SMETHODS DONE and then exits (bad state
-                            // dir, stolen port, ...) would restart in a tight loop.
-                            // Same policy as the client manager above.
-                            if started.elapsed() >= BACKOFF_RESET_UPTIME {
-                                restart_backoff = 0;
-                            } else if restart_backoff < 6 {
-                                restart_backoff += 1;
-                            }
+                    if cancel_clone.is_cancelled() {
+                        break;
+                    }
+
+                    match pt::spawn_pt_server(&pt_cfg, bind_addr, orport_addr).await {
+                        Ok(mut pt_server) => {
+                            tracing::info!(
+                                "PT '{}' listening on {} (ORPORT {})",
+                                pt_cfg.protocol, pt_server.bound_addr, orport_addr
+                            );
+                            let started = Instant::now();
+                            // Accept loop: runs until cancellation or PT exit.
                             loop {
-                                let wait = Duration::from_secs(1u64 << restart_backoff);
-                                tracing::debug!("PT server '{}' restarting in {:?}", pt_cfg.protocol, wait);
                                 tokio::select! {
-                                    _ = cancel_clone.cancelled() => return,
-                                    _ = tokio::time::sleep(wait) => {}
-                                }
-                                match pt::spawn_pt_server(&pt_cfg, bind_addr, orport_addr).await {
-                                    Ok(p) => {
-                                        tracing::info!(
-                                            "PT server '{}' restarted on {}",
-                                            pt_cfg.protocol, p.bound_addr
-                                        );
-                                        pt_server = p;
-                                        started = Instant::now();
+                                    _ = cancel_clone.cancelled() => {
+                                        // Close stdin and wait rather than dropping: a drop
+                                        // SIGKILLs via kill_on_drop, and the PT was spawned
+                                        // with TOR_PT_EXIT_ON_STDIN_CLOSE precisely so it can
+                                        // exit cleanly (releasing its public listener socket).
+                                        pt::shutdown_pt_server(pt_server).await;
+                                        return;
+                                    }
+                                    // The PT process exiting is otherwise invisible: the ORPORT
+                                    // socket stays bound (Yggdrasil owns it), so accept() never
+                                    // errors on a PT crash. Watch the child directly and restart
+                                    // it with exponential backoff.
+                                    _ = pt_server.child.wait() => {
+                                        tracing::warn!("PT server '{}' process exited, restarting", pt_cfg.protocol);
+                                        // Backoff applies to a spawn that *succeeds* but dies
+                                        // young too, not just to spawn failures — otherwise a PT
+                                        // that reports SMETHODS DONE and then exits (bad state
+                                        // dir, stolen port, ...) would restart in a tight loop.
+                                        // Same policy as the client manager above.
+                                        if started.elapsed() >= BACKOFF_RESET_UPTIME {
+                                            backoff = 0;
+                                        } else if backoff < 6 {
+                                            backoff += 1;
+                                        }
                                         break;
                                     }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "PT server '{}' restart failed: {}",
-                                            pt_cfg.protocol, e
-                                        );
-                                        if restart_backoff < 6 { restart_backoff += 1; }
+                                    result = orport_listener.accept() => {
+                                        match result {
+                                            Ok((stream, remote)) => {
+                                                let permit = match connection_limiter.clone().try_acquire_owned() {
+                                                    Ok(p) => p,
+                                                    Err(_) => {
+                                                        tracing::warn!(
+                                                            "PT: too many concurrent connections, rejecting from {}",
+                                                            remote
+                                                        );
+                                                        continue;
+                                                    }
+                                                };
+                                                stream.set_nodelay(true).ok();
+                                                let core = core.clone();
+                                                let opts = options.clone();
+                                                let active = active.clone();
+                                                let remote_str = format!("{}://{}", pt_cfg.protocol, remote);
+                                                tokio::spawn(async move {
+                                                    let _ = handle_connection(
+                                                        LinkType::Incoming,
+                                                        opts,
+                                                        Stream::Pt(stream, Some(remote)),
+                                                        &core,
+                                                        &active,
+                                                        &remote_str,
+                                                    ).await;
+                                                    drop(permit);
+                                                });
+                                            }
+                                            Err(e) => {
+                                                tracing::error!("PT ORPORT accept error: {}", e);
+                                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
-                        result = orport_listener.accept() => {
-                            match result {
-                                Ok((stream, remote)) => {
-                                    let permit = match connection_limiter.clone().try_acquire_owned() {
-                                        Ok(p) => p,
-                                        Err(_) => {
-                                            tracing::warn!(
-                                                "PT: too many concurrent connections, rejecting from {}",
-                                                remote
-                                            );
-                                            continue;
-                                        }
-                                    };
-                                    stream.set_nodelay(true).ok();
-                                    let core = core.clone();
-                                    let opts = options.clone();
-                                    let active = active.clone();
-                                    let remote_str = format!("{}://{}", pt_cfg.protocol, remote);
-                                    tokio::spawn(async move {
-                                        let _ = handle_connection(
-                                            LinkType::Incoming,
-                                            opts,
-                                            Stream::Pt(stream, Some(remote)),
-                                            &core,
-                                            &active,
-                                            &remote_str,
-                                        ).await;
-                                        drop(permit);
-                                    });
-                                }
-                                Err(e) => {
-                                    tracing::error!("PT ORPORT accept error: {}", e);
-                                    tokio::time::sleep(Duration::from_millis(100)).await;
-                                }
-                            }
+                        Err(e) => {
+                            tracing::error!("PT server '{}' failed to start: {}", pt_cfg.protocol, e);
+                            if backoff < 6 { backoff += 1; }
                         }
                     }
+
+                    let wait = Duration::from_secs(1u64 << backoff);
+                    tracing::debug!("PT server '{}' retrying in {:?}", pt_cfg.protocol, wait);
+                    tokio::select! {
+                        _ = cancel_clone.cancelled() => break,
+                        _ = tokio::time::sleep(wait) => {}
+                    }
                 }
+                tracing::debug!("PT server '{}' stopped", pt_cfg.protocol);
             });
 
             self.listeners.insert(addr_str, (cancel, handle));
