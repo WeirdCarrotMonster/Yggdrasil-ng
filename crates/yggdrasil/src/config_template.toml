@@ -153,6 +153,11 @@ allow_icmp_echo = true
 #   On first run the PT binary generates a server certificate and prints it to
 #   its log / state dir. Clients need that cert value in their peer URL.
 #
+# NOTE: inbound PT connections reach Yggdrasil over a loopback ORPORT, so the
+# automatic IP ban / rate-limit machinery cannot see the real client address
+# and is intentionally bypassed for them. Do not rely on peer banning to protect
+# a PT listener; use the PT's own access controls or a firewall upstream.
+#
 # Example — obfs4 via lyrebird:
 # [[pluggable_transport]]
 # protocol = "obfs4"

@@ -687,7 +687,21 @@ impl Links {
         &mut self,
         configs: &[crate::config::PluggableTransportConfig],
     ) {
+        // Schemes handled by built-in transports; a PT may not shadow them or
+        // it would resolve inconsistently between listen() and add_peer().
+        const RESERVED_SCHEMES: &[&str] = &["tcp", "tls", "ws", "wss", "quic"];
+
         for cfg in configs {
+            if RESERVED_SCHEMES.contains(&cfg.protocol.as_str()) {
+                tracing::error!("PT protocol '{}' collides with a built-in transport scheme, ignoring", cfg.protocol);
+                continue;
+            }
+            // The protocol name is used verbatim as a URL scheme, so it must be a
+            // valid one: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) per RFC 3986.
+            if !is_valid_url_scheme(&cfg.protocol) {
+                tracing::error!("PT protocol '{}' is not a valid URL scheme, ignoring", cfg.protocol);
+                continue;
+            }
             if self.pt_configs.contains_key(&cfg.protocol) {
                 tracing::warn!("PT protocol '{}' configured more than once, ignoring duplicate", cfg.protocol);
                 continue;
@@ -713,7 +727,7 @@ impl Links {
                                     "PT client '{}' ready on {}",
                                     cfg.protocol, proc.socks_addr
                                 );
-                                backoff = 0;
+                                let started = Instant::now();
                                 tokio::select! {
                                     _ = cancel.cancelled() => {
                                         pt::shutdown_pt_client(proc).await;
@@ -725,6 +739,15 @@ impl Links {
                                             "PT client '{}' exited unexpectedly, restarting",
                                             cfg.protocol
                                         );
+                                        // Only clear backoff if the process stayed up
+                                        // long enough to be considered healthy;
+                                        // otherwise a fast crash-loop would retry every
+                                        // second forever.
+                                        if started.elapsed() >= BACKOFF_RESET_UPTIME {
+                                            backoff = 0;
+                                        } else if backoff < 6 {
+                                            backoff += 1;
+                                        }
                                     }
                                 }
                             }
@@ -1662,6 +1685,18 @@ fn parse_duration_string(s: &str) -> Result<Duration, String> {
     }
 
     Ok(Duration::from_secs(total_secs))
+}
+
+/// Whether `s` is a syntactically valid URL scheme per RFC 3986:
+/// `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`.
+#[cfg(feature = "pt")]
+fn is_valid_url_scheme(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 /// Parse link options from a URL's query parameters.
