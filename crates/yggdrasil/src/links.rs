@@ -747,6 +747,7 @@ impl Links {
         self.pt_client_rxs.insert(protocol.to_string(), rx);
 
         let cancel = CancellationToken::new();
+        let retry_notify = self.retry_notify.clone();
         let handle = tokio::spawn({
             let cancel = cancel.clone();
             async move {
@@ -761,6 +762,11 @@ impl Links {
                                 "PT client '{}' ready on {}",
                                 cfg.protocol, proc.socks_addr
                             );
+                            // Peers that failed to dial while the PT was starting
+                            // are asleep on their backoff timers. Wake them now so
+                            // they retry against the ready proxy instead of drifting
+                            // toward maxbackoff.
+                            retry_notify.notify_waiters();
                             let started = Instant::now();
                             tokio::select! {
                                 _ = cancel.cancelled() => {
