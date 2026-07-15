@@ -286,15 +286,11 @@ pub(crate) async fn pt_socks5_connect(
         m => return Err(format!("SOCKS5: server chose unsupported method 0x{:02x}", m)),
     }
 
-    // --- CONNECT request (ATYPE 0x03 = domain name) ---
-    let host_bytes = target_host.as_bytes();
-    if host_bytes.len() > 255 {
-        return Err(format!("target hostname too long: {}", target_host));
-    }
-    let mut req = Vec::with_capacity(7 + host_bytes.len());
-    req.extend_from_slice(&[0x05, 0x01, 0x00, 0x03]);
-    req.push(host_bytes.len() as u8);
-    req.extend_from_slice(host_bytes);
+    // --- CONNECT request ---
+    let addr = encode_socks5_addr(target_host)?;
+    let mut req = Vec::with_capacity(5 + addr.len());
+    req.extend_from_slice(&[0x05, 0x01, 0x00]);
+    req.extend_from_slice(&addr);
     req.push((target_port >> 8) as u8);
     req.push((target_port & 0xff) as u8);
     stream.write_all(&req).await
@@ -323,6 +319,48 @@ pub(crate) async fn pt_socks5_connect(
         .map_err(|e| format!("SOCKS5 bound addr drain: {}", e))?;
 
     Ok(stream)
+}
+
+/// Encode a SOCKS5 destination address (ATYP + address bytes, RFC 1928 §4).
+///
+/// IP literals — including the bracketed IPv6 form that `Url::host_str()`
+/// produces — use the native ATYP 0x01/0x04 encodings. Sending a literal as a
+/// "domain name" instead breaks in practice: Go-based PTs (lyrebird, Snowflake)
+/// feed the domain string through `net.JoinHostPort`, which double-brackets a
+/// bracketed IPv6 address into an undialable `[[::1]]:port`, and Tor itself
+/// never exercises the domain path for bridge IPs. Genuine hostnames keep
+/// ATYP 0x03 so the PT resolves them inside the obfuscated channel.
+fn encode_socks5_addr(host: &str) -> Result<Vec<u8>, String> {
+    let literal = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = literal.parse::<std::net::IpAddr>() {
+        return Ok(match ip {
+            std::net::IpAddr::V4(v4) => {
+                let mut out = Vec::with_capacity(5);
+                out.push(0x01);
+                out.extend_from_slice(&v4.octets());
+                out
+            }
+            std::net::IpAddr::V6(v6) => {
+                let mut out = Vec::with_capacity(17);
+                out.push(0x04);
+                out.extend_from_slice(&v6.octets());
+                out
+            }
+        });
+    }
+
+    let host_bytes = host.as_bytes();
+    if host_bytes.len() > 255 {
+        return Err(format!("target hostname too long: {}", host));
+    }
+    let mut out = Vec::with_capacity(2 + host_bytes.len());
+    out.push(0x03);
+    out.push(host_bytes.len() as u8);
+    out.extend_from_slice(host_bytes);
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -462,6 +500,44 @@ mod tests {
     fn split_socks5_auth_too_long() {
         let s = "d".repeat(511);
         assert!(split_socks5_auth(&s).is_err());
+    }
+
+    #[test]
+    fn encode_socks5_addr_ipv4_literal() {
+        assert_eq!(
+            encode_socks5_addr("192.0.2.1").unwrap(),
+            vec![0x01, 192, 0, 2, 1]
+        );
+    }
+
+    #[test]
+    fn encode_socks5_addr_ipv6_bracketed() {
+        // Url::host_str() keeps the brackets; they must not leak into the
+        // encoded address.
+        let mut expected = vec![0x04];
+        expected.extend_from_slice(&"2001:db8::1".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        assert_eq!(encode_socks5_addr("[2001:db8::1]").unwrap(), expected);
+    }
+
+    #[test]
+    fn encode_socks5_addr_ipv6_bare() {
+        let mut expected = vec![0x04];
+        expected.extend_from_slice(&"::1".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        assert_eq!(encode_socks5_addr("::1").unwrap(), expected);
+    }
+
+    #[test]
+    fn encode_socks5_addr_hostname() {
+        let host = "bridge.example.com";
+        let mut expected = vec![0x03, host.len() as u8];
+        expected.extend_from_slice(host.as_bytes());
+        assert_eq!(encode_socks5_addr(host).unwrap(), expected);
+    }
+
+    #[test]
+    fn encode_socks5_addr_hostname_too_long() {
+        let host = "a".repeat(256);
+        assert!(encode_socks5_addr(&host).is_err());
     }
 
     /// Simulate parsing a well-formed CMETHOD + CMETHODS DONE sequence.
