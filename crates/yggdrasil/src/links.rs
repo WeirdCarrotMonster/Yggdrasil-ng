@@ -733,25 +733,32 @@ impl Links {
     }
 
     /// Ensure a PT client manager is running for `protocol`, starting it on
-    /// first use. Idempotent: a second call for the same protocol is a no-op.
+    /// first use, and return a receiver for its SOCKS5 proxy address.
+    /// Idempotent: a second call for the same protocol reuses the manager.
     ///
     /// The manager task owns the PT child process, restarts it on crash with
     /// exponential backoff, and broadcasts the current SOCKS5 proxy address via
-    /// a watch channel. Peer reconnect tasks clone the receiver and check it
+    /// a watch channel. Peer reconnect tasks hold the receiver and check it
     /// before dialling — `None` means the PT is not yet ready.
     #[cfg(feature = "pt")]
-    fn ensure_pt_client(&mut self, protocol: &str) {
+    fn ensure_pt_client(
+        &mut self,
+        protocol: &str,
+    ) -> tokio::sync::watch::Receiver<Option<std::net::SocketAddr>> {
         // A receiver already exists → the manager is running for this protocol.
-        if self.pt_client_rxs.contains_key(protocol) {
-            return;
+        if let Some(rx) = self.pt_client_rxs.get(protocol) {
+            return rx.clone();
         }
         let cfg = match self.pt_configs.get(protocol) {
             Some(cfg) => cfg.clone(),
-            None => return, // not a registered PT scheme; callers guard this
+            // Not a registered PT scheme; callers guard this. A dead receiver
+            // (sender already dropped) keeps the peer permanently in the
+            // "PT client not ready" state instead of panicking.
+            None => return tokio::sync::watch::channel(None).1,
         };
 
         let (tx, rx) = tokio::sync::watch::channel::<Option<std::net::SocketAddr>>(None);
-        self.pt_client_rxs.insert(protocol.to_string(), rx);
+        self.pt_client_rxs.insert(protocol.to_string(), rx.clone());
 
         let cancel = CancellationToken::new();
         let handle = tokio::spawn({
@@ -815,6 +822,7 @@ impl Links {
             }
         });
         self.pt_client_tasks.push((cancel, handle));
+        rx
     }
 
     /// Start listening on an address (e.g. "tcp://0.0.0.0:1234", "tls://0.0.0.0:2345",
@@ -1160,11 +1168,6 @@ impl Links {
 
         #[cfg(feature = "pt")]
         let use_pt = self.pt_configs.contains_key(scheme.as_str());
-        // Start the PT client subprocess on first use of this scheme.
-        #[cfg(feature = "pt")]
-        if use_pt {
-            self.ensure_pt_client(&scheme);
-        }
 
         let host = url.host_str().ok_or("missing host")?.to_string();
         // `port_or_known_default()` so `ws://host` / `wss://host` infer 80/443.
@@ -1236,13 +1239,13 @@ impl Links {
         // Initialize error entry for this peer
         peer_errors.lock().await.insert(uri.to_string(), None);
 
-        // PT: clone the watch receiver for this protocol and collect per-connection args.
+        // PT: start the client subprocess on first use of this scheme and grab
+        // the watch receiver. Deliberately placed after every fallible check:
+        // starting it any earlier would leave a PT manager running forever
+        // (there is no lazy stop) for a peer URL that then fails validation.
         #[cfg(feature = "pt")]
         let mut pt_socks_rx = if use_pt {
-            match self.pt_client_rxs.get(scheme.as_str()) {
-                Some(rx) => rx.clone(),
-                None => return Err(format!("PT protocol '{}' has no watch receiver (internal error)", scheme)),
-            }
+            self.ensure_pt_client(&scheme)
         } else {
             tokio::sync::watch::channel(None).1
         };
