@@ -12,7 +12,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufR
 use tokio::net::TcpStream;
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::time::timeout;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::config::PluggableTransportConfig;
 
@@ -189,8 +189,9 @@ pub(crate) async fn spawn_pt_server(
     let mut lines = BufReader::new(stdout).lines();
     let protocol = cfg.protocol.clone();
 
-    let bound_addr = timeout(Duration::from_secs(30), async {
+    let (bound_addr, client_args) = timeout(Duration::from_secs(30), async {
         let mut found: Option<SocketAddr> = None;
+        let mut client_args: Option<String> = None;
         loop {
             let line = lines.next_line().await
                 .map_err(|e| format!("PT server '{}': read error: {}", protocol, e))?
@@ -212,15 +213,28 @@ pub(crate) async fn spawn_pt_server(
             if let Some(rest) = line.strip_prefix("SMETHOD ") {
                 let parts: Vec<&str> = rest.splitn(2, ' ').collect();
                 if parts.len() == 2 && parts[0] == protocol {
-                    let addr_str = parts[1].split_ascii_whitespace().next().unwrap_or("");
-                    found = addr_str.parse::<SocketAddr>().ok();
+                    let mut tokens = parts[1].split_ascii_whitespace();
+                    found = tokens.next().unwrap_or("").parse::<SocketAddr>().ok();
+                    client_args = tokens
+                        .find_map(|t| t.strip_prefix("ARGS:"))
+                        .map(str::to_string);
                 }
             }
         }
-        found.ok_or_else(|| format!("PT server '{}': no SMETHOD line seen before SMETHODS DONE", protocol))
+        found
+            .map(|addr| (addr, client_args))
+            .ok_or_else(|| format!("PT server '{}': no SMETHOD line seen before SMETHODS DONE", protocol))
     })
     .await
     .map_err(|_| format!("PT server '{}': timed out waiting for SMETHODS DONE", cfg.protocol))??;
+
+    // The ARGS values are what clients must put in their peer URL query — for
+    // obfs4 that includes the cert, which otherwise only exists in the state
+    // dir. Surface them at info so a bridge operator doesn't have to go
+    // digging (comma-separated k=v here maps to &-separated k=v in the URL).
+    if let Some(args) = &client_args {
+        info!("PT server '{}' client connection args: {}", protocol, args);
+    }
 
     // Keep draining PT output for the life of the process (see spawn_pt_client).
     spawn_output_logger(lines, protocol.clone(), "stdout");
