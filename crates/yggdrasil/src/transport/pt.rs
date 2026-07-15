@@ -108,15 +108,27 @@ pub(crate) async fn shutdown_pt_client(mut proc: PtClientProcess) {
 }
 
 /// Continuously read newline-delimited PT output and forward each line to the
-/// tracing log at debug level.  Runs until the pipe closes (process exit).
+/// tracing log.  Runs until the pipe closes (process exit).
+///
+/// stderr goes to info: it is where PTs report per-connection failures (bad
+/// cert, clock skew, ...) after startup, and at debug those only manifest as
+/// silent reconnect loops.  stdout — control-protocol chatter once the
+/// startup lines have been consumed — stays at debug.
 fn spawn_output_logger<R>(mut lines: tokio::io::Lines<R>, protocol: String, stream: &'static str)
 where
     R: AsyncBufRead + Unpin + Send + 'static,
 {
+    let is_stderr = stream == "stderr";
     tokio::spawn(async move {
         loop {
             match lines.next_line().await {
-                Ok(Some(line)) => debug!(pt = %protocol, stream, line = %line, "pt output"),
+                Ok(Some(line)) => {
+                    if is_stderr {
+                        info!(pt = %protocol, stream, line = %line, "pt output");
+                    } else {
+                        debug!(pt = %protocol, stream, line = %line, "pt output");
+                    }
+                }
                 Ok(None) => break,
                 Err(e) => {
                     debug!(pt = %protocol, stream, "pt output read error: {}", e);
