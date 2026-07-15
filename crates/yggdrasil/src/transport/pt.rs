@@ -12,7 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::config::PluggableTransportConfig;
 
@@ -200,20 +200,16 @@ pub(crate) async fn pt_socks5_connect(
     }
 
     // --- Sub-negotiation (RFC 1929) ---
-    let username = encode_pt_args(pt_args);
-    let ulen = username.len();
-    if ulen > 255 {
-        warn!("PT args exceed 255 bytes ({}), truncating SOCKS5 username", ulen);
-    }
-    let username_bytes = &username.as_bytes()[..ulen.min(255)];
-    let password_bytes: &[u8] = &[0x00]; // PT spec: password field unused
+    // PT args ride in the username field; if they overflow 255 bytes the
+    // remainder spills into the password field (pt-spec §3.5).
+    let (username_bytes, password_bytes) = split_socks5_auth(&encode_pt_args(pt_args))?;
 
-    let mut subneg = Vec::with_capacity(3 + username_bytes.len() + 1);
+    let mut subneg = Vec::with_capacity(3 + username_bytes.len() + password_bytes.len());
     subneg.push(0x01);
     subneg.push(username_bytes.len() as u8);
-    subneg.extend_from_slice(username_bytes);
+    subneg.extend_from_slice(&username_bytes);
     subneg.push(password_bytes.len() as u8);
-    subneg.extend_from_slice(password_bytes);
+    subneg.extend_from_slice(&password_bytes);
     stream.write_all(&subneg).await
         .map_err(|e| format!("SOCKS5 sub-neg write: {}", e))?;
 
@@ -289,6 +285,24 @@ pub(crate) fn encode_pt_args(args: &[(String, String)]) -> String {
     out
 }
 
+/// Split an encoded PT arg string into SOCKS5 username/password fields
+/// (RFC 1929, as used by pt-spec §3.5).
+///
+/// * empty          → a single NUL username, NUL password (RFC 1929 forbids
+///                    zero-length fields, and PTs expect a NUL placeholder)
+/// * `len <= 255`   → all in username, NUL password
+/// * `len <= 510`   → first 255 bytes username, remainder password
+/// * `len > 510`    → error (cannot be represented in two 255-byte fields)
+fn split_socks5_auth(encoded: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let bytes = encoded.as_bytes();
+    match bytes.len() {
+        0 => Ok((vec![0x00], vec![0x00])),
+        1..=255 => Ok((bytes.to_vec(), vec![0x00])),
+        256..=510 => Ok((bytes[..255].to_vec(), bytes[255..].to_vec())),
+        n => Err(format!("PT args too long to encode in SOCKS5 auth: {} bytes (max 510)", n)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -323,6 +337,50 @@ mod tests {
     fn encode_pt_args_single() {
         let args = vec![("key".to_string(), "val".to_string())];
         assert_eq!(encode_pt_args(&args), "key=val");
+    }
+
+    #[test]
+    fn split_socks5_auth_empty() {
+        // RFC 1929 forbids zero-length fields; empty args become NUL placeholders.
+        assert_eq!(split_socks5_auth("").unwrap(), (vec![0x00], vec![0x00]));
+    }
+
+    #[test]
+    fn split_socks5_auth_short() {
+        let (u, p) = split_socks5_auth("cert=abc").unwrap();
+        assert_eq!(u, b"cert=abc");
+        assert_eq!(p, vec![0x00]);
+    }
+
+    #[test]
+    fn split_socks5_auth_boundary_255() {
+        let s = "a".repeat(255);
+        let (u, p) = split_socks5_auth(&s).unwrap();
+        assert_eq!(u.len(), 255);
+        assert_eq!(p, vec![0x00]);
+    }
+
+    #[test]
+    fn split_socks5_auth_spills_to_password() {
+        let s = "b".repeat(300);
+        let (u, p) = split_socks5_auth(&s).unwrap();
+        assert_eq!(u.len(), 255);
+        assert_eq!(p.len(), 45);
+        assert_eq!(u.len() + p.len(), 300);
+    }
+
+    #[test]
+    fn split_socks5_auth_boundary_510() {
+        let s = "c".repeat(510);
+        let (u, p) = split_socks5_auth(&s).unwrap();
+        assert_eq!(u.len(), 255);
+        assert_eq!(p.len(), 255);
+    }
+
+    #[test]
+    fn split_socks5_auth_too_long() {
+        let s = "d".repeat(511);
+        assert!(split_socks5_auth(&s).is_err());
     }
 
     /// Simulate parsing a well-formed CMETHOD + CMETHODS DONE sequence.
