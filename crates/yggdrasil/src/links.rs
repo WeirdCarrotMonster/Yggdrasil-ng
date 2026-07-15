@@ -692,26 +692,33 @@ impl Links {
         const RESERVED_SCHEMES: &[&str] = &["tcp", "tls", "ws", "wss", "quic"];
 
         for cfg in configs {
-            if RESERVED_SCHEMES.contains(&cfg.protocol.as_str()) {
+            // The `url` crate lowercases schemes on parse, so peer/listen URLs
+            // always arrive lowercased. Normalise the configured protocol the
+            // same way, or an entry like `protocol = "Obfs4"` would register but
+            // never match any URL (and could even sneak past RESERVED_SCHEMES).
+            let protocol = cfg.protocol.to_ascii_lowercase();
+
+            if RESERVED_SCHEMES.contains(&protocol.as_str()) {
                 tracing::error!("PT protocol '{}' collides with a built-in transport scheme, ignoring", cfg.protocol);
                 continue;
             }
             // The protocol name is used verbatim as a URL scheme, so it must be a
             // valid one: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) per RFC 3986.
-            if !is_valid_url_scheme(&cfg.protocol) {
+            if !is_valid_url_scheme(&protocol) {
                 tracing::error!("PT protocol '{}' is not a valid URL scheme, ignoring", cfg.protocol);
                 continue;
             }
-            if self.pt_configs.contains_key(&cfg.protocol) {
+            if self.pt_configs.contains_key(&protocol) {
                 tracing::warn!("PT protocol '{}' configured more than once, ignoring duplicate", cfg.protocol);
                 continue;
             }
-            self.pt_configs.insert(cfg.protocol.clone(), cfg.clone());
+            let mut cfg = cfg.clone();
+            cfg.protocol = protocol.clone();
+            self.pt_configs.insert(protocol.clone(), cfg.clone());
 
             let (tx, rx) = tokio::sync::watch::channel::<Option<std::net::SocketAddr>>(None);
-            self.pt_client_rxs.insert(cfg.protocol.clone(), rx);
+            self.pt_client_rxs.insert(protocol.clone(), rx);
 
-            let cfg = cfg.clone();
             let cancel = CancellationToken::new();
             let handle = tokio::spawn({
                 let cancel = cancel.clone();
