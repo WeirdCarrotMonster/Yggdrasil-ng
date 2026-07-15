@@ -747,7 +747,6 @@ impl Links {
         self.pt_client_rxs.insert(protocol.to_string(), rx);
 
         let cancel = CancellationToken::new();
-        let retry_notify = self.retry_notify.clone();
         let handle = tokio::spawn({
             let cancel = cancel.clone();
             async move {
@@ -757,16 +756,16 @@ impl Links {
 
                     match pt::spawn_pt_client(&cfg).await {
                         Ok(mut proc) => {
+                            // Peers that failed to dial while the PT was starting
+                            // are asleep on their backoff timers; this send wakes
+                            // them (they select on the watch channel) so they retry
+                            // against the ready proxy instead of drifting toward
+                            // maxbackoff.
                             let _ = tx.send(Some(proc.socks_addr));
                             tracing::info!(
                                 "PT client '{}' ready on {}",
                                 cfg.protocol, proc.socks_addr
                             );
-                            // Peers that failed to dial while the PT was starting
-                            // are asleep on their backoff timers. Wake them now so
-                            // they retry against the ready proxy instead of drifting
-                            // toward maxbackoff.
-                            retry_notify.notify_waiters();
                             let started = Instant::now();
                             tokio::select! {
                                 _ = cancel.cancelled() => {
@@ -1225,7 +1224,7 @@ impl Links {
 
         // PT: clone the watch receiver for this protocol and collect per-connection args.
         #[cfg(feature = "pt")]
-        let pt_socks_rx = if use_pt {
+        let mut pt_socks_rx = if use_pt {
             match self.pt_client_rxs.get(scheme.as_str()) {
                 Some(rx) => rx.clone(),
                 None => return Err(format!("PT protocol '{}' has no watch receiver (internal error)", scheme)),
@@ -1249,7 +1248,13 @@ impl Links {
                 let dial_result: Result<Stream, String> = async {
                     #[cfg(feature = "pt")]
                     if use_pt {
-                        let socks_addr = match *pt_socks_rx.borrow() {
+                        // borrow_and_update (not borrow) marks this value as seen,
+                        // so the pt_client_became_ready arm of the backoff select
+                        // below fires exactly for values sent *after* this read —
+                        // including one sent before we reach the select. A plain
+                        // borrow would leave that window open and the peer would
+                        // sleep its full accumulated backoff.
+                        let socks_addr = match *pt_socks_rx.borrow_and_update() {
                             Some(a) => a,
                             None => return Err("PT client not ready (process starting or crashed)".to_string()),
                         };
@@ -1321,6 +1326,15 @@ impl Links {
                 let wait = Duration::from_secs(1u64 << backoff.min(BACKOFF_SHIFT_MAX))
                     .min(options.max_backoff);
 
+                // For PT peers, also wake as soon as the PT client becomes ready:
+                // the watch channel's version counter makes this race-free, unlike
+                // retry_notify (notify_waiters only reaches tasks already parked).
+                // For non-PT peers the future never resolves.
+                #[cfg(feature = "pt")]
+                let pt_ready = pt_client_became_ready(&mut pt_socks_rx);
+                #[cfg(not(feature = "pt"))]
+                let pt_ready = std::future::pending::<()>();
+
                 tokio::select! {
                     _ = cancel_clone.cancelled() => break,
                     _ = tokio::time::sleep(wait) => {}
@@ -1328,6 +1342,7 @@ impl Links {
                         // Reset backoff after the network change
                         backoff = 0;
                     }
+                    _ = pt_ready => {}
                 }
             }
         });
@@ -1771,6 +1786,22 @@ fn parse_duration_string(s: &str) -> Result<Duration, String> {
     }
 
     Ok(Duration::from_secs(total_secs))
+}
+
+/// Resolve when the PT client for this peer's protocol becomes ready — i.e.
+/// the watch value transitions to `Some` after the last `borrow_and_update`.
+/// Never resolves for non-PT peers (their dummy receiver's sender is already
+/// dropped) or after the PT managers are torn down; cancellation wins instead.
+#[cfg(feature = "pt")]
+async fn pt_client_became_ready(rx: &mut tokio::sync::watch::Receiver<Option<SocketAddr>>) {
+    loop {
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        if rx.borrow_and_update().is_some() {
+            return;
+        }
+    }
 }
 
 /// Whether `s` is a syntactically valid URL scheme per RFC 3986:
