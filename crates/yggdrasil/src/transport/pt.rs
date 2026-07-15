@@ -235,6 +235,9 @@ pub(crate) async fn pt_socks5_connect(
     let mut stream = TcpStream::connect(socks_addr)
         .await
         .map_err(|e| format!("SOCKS5 connect to {}: {}", socks_addr, e))?;
+    // Match the other dial paths: disable Nagle so the link protocol isn't
+    // held back behind small writes.
+    stream.set_nodelay(true).ok();
 
     // --- Greeting: request method 0x02 (username/password) ---
     stream.write_all(&[0x05, 0x01, 0x02]).await
