@@ -111,6 +111,13 @@ pub struct Config {
     /// from the per-peer/per-multicast `password`, which gates direct peering.
     #[serde(default)]
     pub group_password: String,
+
+    /// Prometheus metrics HTTP listen address, e.g. `"tcp://localhost:9100"`.
+    /// Set to empty string or `"none"` to disable. Only present when the
+    /// `metrics` feature is enabled.
+    #[cfg(feature = "metrics")]
+    #[serde(default = "default_metrics_listen")]
+    pub metrics_listen: String,
 }
 
 /// Built-in stateful firewall configuration. Default-off; when enabled,
@@ -218,6 +225,11 @@ fn default_admin_listen() -> String {
     "tcp://localhost:9001".to_string()
 }
 
+#[cfg(feature = "metrics")]
+fn default_metrics_listen() -> String {
+    "tcp://localhost:9100".to_string()
+}
+
 fn default_if_name() -> String {
     "auto".to_string()
 }
@@ -248,6 +260,8 @@ impl Default for Config {
             tunnel_routing: TunnelRoutingConfig::default(),
             firewall: FirewallConfig::default(),
             group_password: String::new(),
+            #[cfg(feature = "metrics")]
+            metrics_listen: default_metrics_listen(),
         }
     }
 }

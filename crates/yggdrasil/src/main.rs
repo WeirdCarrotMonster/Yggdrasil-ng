@@ -9,6 +9,8 @@ use yggdrasil::admin::AdminSocket;
 use yggdrasil::config::Config;
 use yggdrasil::core::Core;
 use yggdrasil::ipv6rwc::ReadWriteCloser;
+#[cfg(feature = "metrics")]
+use yggdrasil::metrics::MetricsSocket;
 
 #[cfg(feature = "tun")]
 use yggdrasil::tun::TunAdapter;
@@ -424,6 +426,16 @@ async fn run_node(
         }
     };
 
+    // Start Prometheus metrics endpoint
+    #[cfg(feature = "metrics")]
+    let metrics = match MetricsSocket::new(&config.metrics_listen, core.clone()).await {
+        Ok(m) => Some(m),
+        Err(e) => {
+            tracing::warn!("Failed to start metrics socket: {}", e);
+            None
+        }
+    };
+
     // Start multicast peer discovery
     if let Err(e) = core.start_multicast().await {
         tracing::warn!("Multicast peer discovery disabled: {}", e);
@@ -480,6 +492,10 @@ async fn run_node(
     core.close_multicast().await;
     if let Some(admin) = &admin {
         admin.close();
+    }
+    #[cfg(feature = "metrics")]
+    if let Some(m) = &metrics {
+        m.close();
     }
     core.close().await.ok();
 
