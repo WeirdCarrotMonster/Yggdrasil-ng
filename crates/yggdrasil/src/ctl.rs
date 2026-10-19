@@ -1,13 +1,13 @@
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
-/// Run a control command against the admin socket.
-pub async fn run_ctl(
+/// Send one request to the admin socket and return the full response
+/// envelope, whatever its status. Exits on an empty response.
+async fn admin_call(
     endpoint: &str,
-    json_output: bool,
     command: &str,
     arguments: serde_json::Map<String, serde_json::Value>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let request = serde_json::json!({
         "request": command,
         "arguments": arguments,
@@ -38,14 +38,12 @@ pub async fn run_ctl(
         std::process::exit(1);
     }
 
-    let resp: serde_json::Value = serde_json::from_str(line.trim())?;
+    Ok(serde_json::from_str(line.trim())?)
+}
 
-    if json_output {
-        println!("{}", serde_json::to_string_pretty(&resp)?);
-        return Ok(());
-    }
-
-    // Check status
+/// The `response` member of a successful envelope. On any other status,
+/// prints the error and exits 1.
+fn success_response(resp: &serde_json::Value) -> &serde_json::Value {
     let status = resp
         .get("status")
         .and_then(|v| v.as_str())
@@ -60,7 +58,24 @@ pub async fn run_ctl(
         std::process::exit(1);
     }
 
-    let response = &resp["response"];
+    &resp["response"]
+}
+
+/// Run a control command against the admin socket.
+pub async fn run_ctl(
+    endpoint: &str,
+    json_output: bool,
+    command: &str,
+    arguments: serde_json::Map<String, serde_json::Value>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let resp = admin_call(endpoint, command, arguments).await?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&resp)?);
+        return Ok(());
+    }
+
+    let response = success_response(&resp);
 
     // Pretty-print based on command
     match command.to_lowercase().as_str() {
@@ -267,6 +282,210 @@ pub async fn run_ctl(
     }
 
     Ok(())
+}
+
+/// The `ckr` verbs, one per line, for the usage error and the command list.
+#[cfg(feature = "ckr")]
+pub const CKR_VERBS: &str = "\
+ckr list                  show the live route set
+ckr export                print it as a [tunnel_routing.remote_subnets] TOML section
+ckr check <file|->        validate a route set and show what would change
+ckr set <file|->          replace the live route set";
+
+/// Run a `yggdrasil ckr <verb>` subcommand against the admin socket.
+#[cfg(feature = "ckr")]
+pub async fn run_ckr(endpoint: &str, json_output: bool, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::ckr::{CkrApplyReport, CkrKeySubnets};
+    use serde::Deserialize;
+
+    let verb = args.first().map(|s| s.to_ascii_lowercase());
+    let (command, arguments) = match (verb.as_deref(), args.get(1)) {
+        (Some("list" | "export"), None) => ("getckrroutes", serde_json::Map::new()),
+        (Some(verb @ ("check" | "set")), Some(source)) if args.len() == 2 => {
+            let mut arguments = serde_json::Map::new();
+            arguments.insert("remote_subnets".to_string(), serde_json::to_value(read_route_file(source))?);
+            arguments.insert("dry_run".to_string(), serde_json::Value::Bool(verb == "check"));
+            ("setckrroutes", arguments)
+        }
+        _ => {
+            eprintln!("Usage: yggdrasil [options] ckr <verb>");
+            for line in CKR_VERBS.lines() {
+                eprintln!("  {}", line);
+            }
+            std::process::exit(1);
+        }
+    };
+
+    let resp = admin_call(endpoint, command, arguments).await?;
+    let verb = verb.unwrap_or_default();
+    // `export --json` prints the bare map, which `ckr set` accepts back.
+    if json_output && verb != "export" {
+        println!("{}", serde_json::to_string_pretty(&resp)?);
+        // Unlike other commands, exit 1 on an error, so that scripts can
+        // trust the status.
+        if resp.get("status").and_then(|v| v.as_str()) != Some("success") {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    let r = success_response(&resp);
+
+    if verb == "check" || verb == "set" {
+        let report = CkrApplyReport::deserialize(r)?;
+        if report.applied {
+            println!(
+                "Applied: {} IPv4, {} IPv6 routes; system routes +{} -{}",
+                report.ipv4_routes,
+                report.ipv6_routes,
+                report.system_routes_added.len(),
+                report.system_routes_removed.len()
+            );
+        } else {
+            println!("Dry run: nothing changed.");
+            println!("  Table routes:  {} IPv4, {} IPv6", report.ipv4_routes, report.ipv6_routes);
+            println!("  System routes: +{} -{}", report.system_routes_added.len(), report.system_routes_removed.len());
+            for prefix in &report.system_routes_added {
+                println!("    + {}", prefix);
+            }
+            for prefix in &report.system_routes_removed {
+                println!("    - {}", prefix);
+            }
+        }
+        // The table was applied either way, so this is not an error exit.
+        for failure in &report.system_route_failures {
+            eprintln!("Warning: failed to install system route {}: {}", failure.prefix, failure.error);
+        }
+        return Ok(());
+    }
+
+    if r.get("enabled").and_then(|v| v.as_bool()) != Some(true) {
+        if verb == "export" {
+            eprintln!("CKR is not enabled on this node.");
+            std::process::exit(1);
+        }
+        println!("CKR is not enabled on this node.");
+        return Ok(());
+    }
+    let entries = Vec::<CkrKeySubnets>::deserialize(&r["remote_subnets"])?;
+
+    if verb == "export" {
+        let map: SubnetMap = entries.into_iter().map(|e| (e.key, e.subnets)).collect();
+        if json_output {
+            println!("{}", serde_json::to_string_pretty(&map)?);
+        } else {
+            print!("{}", export_toml(&map)?);
+        }
+        return Ok(());
+    }
+
+    print_kv(r, &[
+        ("TUN", "tun"),
+        ("Yggdrasil routing", "yggdrasil_routing"),
+        ("Install system routes", "install_system_routes"),
+        ("IPv4 table routes", "ipv4_routes"),
+        ("IPv6 table routes", "ipv6_routes"),
+        ("System routes", "system_routes"),
+    ]);
+    let rows: Vec<Vec<String>> = entries
+        .iter()
+        .flat_map(|e| {
+            let address = if e.is_self {
+                "(self, ignored)".to_string()
+            } else {
+                e.address.clone().unwrap_or_else(|| "-".to_string())
+            };
+            e.subnets.iter().map(move |s| vec![s.clone(), e.key.clone(), address.clone()])
+        })
+        .collect();
+    println!();
+    if rows.is_empty() {
+        println!("  No remote subnets.");
+    } else {
+        print_table(&["Subnet", "Public Key", "IP Address"], &rows);
+    }
+    let failed = Vec::<String>::deserialize(&r["failed_system_routes"])?;
+    if !failed.is_empty() {
+        println!("\nSystem routes that failed to install (retried on the next 'ckr set'):");
+        for prefix in failed {
+            println!("  {}", prefix);
+        }
+    }
+    Ok(())
+}
+
+/// Read and parse a route file for `ckr check`/`ckr set`, exiting on error.
+/// The file is read here, on the client side: the daemon never opens files
+/// on request, so the admin socket cannot make a root process read
+/// arbitrary paths.
+#[cfg(feature = "ckr")]
+fn read_route_file(source: &str) -> SubnetMap {
+    let text = if source == "-" {
+        std::io::read_to_string(std::io::stdin())
+    } else {
+        std::fs::read_to_string(source)
+    };
+    let text = text.unwrap_or_else(|e| {
+        eprintln!("Error: failed to read {}: {}", source, e);
+        std::process::exit(1);
+    });
+    parse_remote_subnets_doc(&text).unwrap_or_else(|e| {
+        eprintln!("Error: {}: {}", source, e);
+        std::process::exit(1);
+    })
+}
+
+/// Public key hex -> raw subnet entries, as in `tunnel_routing.remote_subnets`.
+#[cfg(feature = "ckr")]
+type SubnetMap = std::collections::BTreeMap<String, Vec<String>>;
+
+/// Render a route set as a `[tunnel_routing.remote_subnets]` TOML section
+/// that can be pasted into the config or fed back to `ckr set`.
+#[cfg(feature = "ckr")]
+fn export_toml(map: &SubnetMap) -> Result<String, toml::ser::Error> {
+    let section = std::collections::BTreeMap::from([("remote_subnets", map)]);
+    toml::to_string(&std::collections::BTreeMap::from([("tunnel_routing", section)]))
+}
+
+/// Extract a `remote_subnets` map from a JSON or TOML document. Accepted
+/// shapes, checked in order:
+///  1. a full config: `tunnel_routing.remote_subnets`
+///  2. `{ remote_subnets = {...} }`
+///  3. the bare map `{ "<hex>" = [...] }`
+///
+/// Only the map is read; other `tunnel_routing` settings are ignored. An
+/// empty document, or a `tunnel_routing` table without `remote_subnets`, is
+/// an error rather than the empty set, so that a misspelt key cannot clear
+/// every live route. Keys and subnets are validated by the daemon.
+#[cfg(feature = "ckr")]
+fn parse_remote_subnets_doc(text: &str) -> Result<SubnetMap, String> {
+    const SHAPES: &str = "expected a [tunnel_routing.remote_subnets] section, a [remote_subnets] table, \
+                          or a bare map of \"<public key hex>\" = [\"<subnet>\", ...]";
+    // TOML cannot start with `{`, so that settles the format.
+    let doc: serde_json::Value = if text.trim_start().starts_with('{') {
+        serde_json::from_str(text).map_err(|e| format!("invalid JSON: {}", e))?
+    } else {
+        let doc: toml::Value = toml::from_str(text).map_err(|e| format!("invalid TOML: {}", e))?;
+        serde_json::to_value(doc).map_err(|e| e.to_string())?
+    };
+    let decode = |v: &serde_json::Value, what: &str| {
+        serde_json::from_value::<SubnetMap>(v.clone()).map_err(|e| format!("{}: {}", what, e))
+    };
+    match doc.as_object() {
+        Some(root) if root.is_empty() && !text.trim_start().starts_with('{') => {
+            Err(format!("document is empty; {}", SHAPES))
+        }
+        Some(root) => match (root.get("tunnel_routing"), root.get("remote_subnets")) {
+            (Some(tr), _) => match tr.get("remote_subnets") {
+                Some(v) => decode(v, "tunnel_routing.remote_subnets"),
+                None => Err("tunnel_routing has no remote_subnets; to clear every route, \
+                             pass an empty [tunnel_routing.remote_subnets] section"
+                    .to_string()),
+            },
+            (None, Some(v)) => decode(v, "remote_subnets"),
+            (None, None) => decode(&doc, "document").map_err(|e| format!("{}; {}", e, SHAPES)),
+        },
+        None => Err(SHAPES.to_string()),
+    }
 }
 
 fn session_rows(sessions: &[serde_json::Value]) -> Vec<Vec<String>> {
@@ -490,6 +709,80 @@ mod tests {
         let (header, rows) = sample();
         let lines = format_table(&header, &rows, None, Some(20));
         assert!(lines[1].starts_with("tls://[201:23b0:9e11:2a7c:4d5f::1]:7743"));
+    }
+    #[cfg(feature = "ckr")]
+    mod ckr_doc {
+        use super::super::*;
+
+        const K1: &str = "0101010101010101010101010101010101010101010101010101010101010101";
+        const K2: &str = "0202020202020202020202020202020202020202020202020202020202020202";
+
+        fn expected() -> SubnetMap {
+            SubnetMap::from([
+                (K1.to_string(), vec!["10.0.0.0/24".to_string(), "~10.1.0.0/16".to_string()]),
+                (K2.to_string(), vec!["!10.0.0.5".to_string(), "inetv6".to_string()]),
+            ])
+        }
+
+        #[test]
+        fn all_shapes_toml_and_json() {
+            let toml = format!("\"{K1}\" = [\"10.0.0.0/24\", \"~10.1.0.0/16\"]\n\"{K2}\" = [\"!10.0.0.5\", \"inetv6\"]\n");
+            let json = format!("{{\"{K1}\": [\"10.0.0.0/24\", \"~10.1.0.0/16\"], \"{K2}\": [\"!10.0.0.5\", \"inetv6\"]}}");
+            for doc in [
+                format!("[tunnel_routing.remote_subnets]\n{toml}"),
+                format!("[remote_subnets]\n{toml}"),
+                toml.clone(),
+                format!("{{\"tunnel_routing\": {{\"remote_subnets\": {json}}}}}"),
+                format!("{{\"remote_subnets\": {json}}}"),
+                json.clone(),
+            ] {
+                assert_eq!(parse_remote_subnets_doc(&doc).unwrap(), expected(), "{}", doc);
+            }
+        }
+
+        #[test]
+        fn full_config_file() {
+            let text = format!(
+                "{}\n[tunnel_routing]\nenable = true\n[tunnel_routing.remote_subnets]\n\
+                 \"{K1}\" = [\"10.0.0.0/24\", \"~10.1.0.0/16\"]\n\"{K2}\" = [\"!10.0.0.5\", \"inetv6\"]\n",
+                crate::config::Config::generate_config_text()
+            );
+            assert!(text.contains("[firewall]"));
+            assert_eq!(parse_remote_subnets_doc(&text).unwrap(), expected());
+        }
+
+        #[test]
+        fn rejects_documents_that_would_clear_by_accident() {
+            for doc in ["", "# only a comment\n", "[tunnel_routing]\nenable = true\n", "{\"tunnel_routing\": {}}"] {
+                assert!(parse_remote_subnets_doc(doc).is_err(), "accepted {:?}", doc);
+            }
+            // Clearing stays possible, explicitly.
+            assert!(parse_remote_subnets_doc("[tunnel_routing.remote_subnets]\n").unwrap().is_empty());
+            assert!(parse_remote_subnets_doc("{}").unwrap().is_empty());
+        }
+
+        #[test]
+        fn rejects_bad_documents() {
+            let err = parse_remote_subnets_doc(&format!("[remote_subnets]\n\"{K1}\" = [\"10.0.0.0/24\", 5]\n"))
+                .unwrap_err();
+            assert!(err.contains("remote_subnets"), "{}", err);
+            // A misspelt section name falls through to the bare map and gets the shapes.
+            let err = parse_remote_subnets_doc("[tunnel_route.remote_subnets]\n\"aa\" = [\"10.0.0.0/24\"]\n")
+                .unwrap_err();
+            assert!(err.contains("expected"), "{}", err);
+            for garbage in ["this is = = not toml", "{not json", "[1, 2]"] {
+                assert!(parse_remote_subnets_doc(garbage).is_err(), "accepted {:?}", garbage);
+            }
+        }
+
+        #[test]
+        fn export_round_trips() {
+            let text = export_toml(&expected()).unwrap();
+            assert!(text.starts_with("[tunnel_routing.remote_subnets]"), "{}", text);
+            assert_eq!(parse_remote_subnets_doc(&text).unwrap(), expected());
+            let empty = export_toml(&SubnetMap::new()).unwrap();
+            assert!(parse_remote_subnets_doc(&empty).unwrap().is_empty());
+        }
     }
 }
 

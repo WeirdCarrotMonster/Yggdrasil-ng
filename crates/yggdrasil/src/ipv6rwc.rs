@@ -12,7 +12,7 @@ use crate::core::Core;
 #[cfg(feature = "ckr")]
 use {
     std::net::IpAddr,
-    crate::ckr::CryptoKey,
+    crate::ckr::CkrManager,
     crate::config::TunnelRoutingConfig,
 };
 use crate::firewall::Firewall;
@@ -49,7 +49,7 @@ pub struct ReadWriteCloser {
     /// interface MTU after the kernel may have clamped `if_mtu`.
     mtu: AtomicU64,
     #[cfg(feature = "ckr")]
-    ckr: Option<CryptoKey>,
+    ckr: Option<Arc<CkrManager>>,
     firewall: Option<Arc<Firewall>>,
 }
 
@@ -79,10 +79,10 @@ impl ReadWriteCloser {
         let ckr = ckr_config
             .filter(|c| c.enable)
             .map(|c| {
-                CryptoKey::new(c, core.public_key()).unwrap_or_else(|e| {
+                Arc::new(CkrManager::new(c, core.public_key()).unwrap_or_else(|e| {
                     tracing::error!("Failed to configure CKR: {}", e);
                     panic!("CKR configuration error: {}", e);
-                })
+                }))
             });
 
         Arc::new(Self {
@@ -499,13 +499,19 @@ impl ReadWriteCloser {
 
     // --- CKR helper methods ---
 
+    /// The CKR route manager, when CKR was enabled at startup.
+    #[cfg(feature = "ckr")]
+    pub fn ckr(&self) -> Option<&Arc<CkrManager>> {
+        self.ckr.as_ref()
+    }
+
     /// CKR inbound validation: check whether a received packet should be
     /// delivered to the TUN based on CKR routing rules.
     /// Returns true if the packet is accepted.
     #[cfg(feature = "ckr")]
     async fn ckr_read_validate(
         &self,
-        ckr: &CryptoKey,
+        ckr: &CkrManager,
         packet: &[u8],
         is_ip4: bool,
         is_ip6: bool,
@@ -544,8 +550,10 @@ impl ReadWriteCloser {
         };
 
         // Look up the source address in CKR table and verify
-        // the route's public key matches the actual sender
-        if let Some(expected_key) = ckr.get_public_key_for_address(src_addr) {
+        // the route's public key matches the actual sender. The table is only
+        // loaded here, past the Yggdrasil-source fast path. No await follows,
+        // so the table guard is never held across one.
+        if let Some(expected_key) = ckr.table().get_public_key_for_address(src_addr) {
             if &expected_key == from_key {
                 return true;
             }
@@ -562,7 +570,7 @@ impl ReadWriteCloser {
     #[cfg(feature = "ckr")]
     async fn ckr_write(
         &self,
-        ckr: &CryptoKey,
+        ckr: &CkrManager,
         buf: &[u8],
         is_ip4: bool,
         is_ip6: bool,
@@ -634,7 +642,9 @@ impl ReadWriteCloser {
             IpAddr::from(dst_addr_bytes)
         };
 
-        if let Some(key) = ckr.get_public_key_for_address(dst_ip) {
+        // Own statement, so the table guard is dropped before the await.
+        let key = ckr.table().get_public_key_for_address(dst_ip);
+        if let Some(key) = key {
             let addr = Addr(key);
             self.core
                 .write_to(buf, &addr)

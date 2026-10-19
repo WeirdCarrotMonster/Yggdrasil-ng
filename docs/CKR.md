@@ -39,7 +39,7 @@ ip_addresses = ["10.99.0.1/24"]
 | `ip_addresses` | array | IP addresses to assign to TUN in CIDR notation (e.g.,`[ "10.99.0.1/24", "2005:8a:9:11::3/64" ]`) |
 | `remote_subnets` | table | Maps hex public key to list of CIDRs to route via that node |
 
-System routes for all configured CIDRs are automatically installed when the TUN device starts and removed on shutdown. This works on Linux, Windows, and macOS.
+System routes for all configured CIDRs are automatically installed when the TUN device starts and removed on shutdown. This works on Linux, Windows, and macOS. The route set can also be replaced while the node runs; see [Changing routes at runtime](#changing-routes-at-runtime).
 
 The list of CIDRs for each public key supports additional syntax (bare IPv4/IPv6 addresses without a subnet prefix are recognised as /32 and /128 respectively; this also applies to addresses beginning with "\~" and "!"):
 
@@ -47,6 +47,59 @@ Prefix an IPv4 or IPv6 address/subnet with "\~" (e.g. "\~0.0.0.0/1", "\~10.0.0.0
 Use "inetv4" to include the full list of IPv4 internet prefixes (excluding internal networks) for both CKR and system routes; use "\~inetv4" for CKR tunnels only without system routes.
 Use "inetv6" or "\~inetv6" similarly for IPv6 (expands to "2000::/3").
 The "!" prefix for exclusions applies to CKR ranges for both normal and "\~" prefixed includes. No "!inetv4" or "!inetv6" are supported.
+
+## Changing routes at runtime
+
+The `remote_subnets` route set of a running node can be replaced without a restart:
+
+```bash
+yggdrasil ckr list                  # show the live route set
+yggdrasil ckr export > routes.toml  # print it as a [tunnel_routing.remote_subnets] section
+yggdrasil ckr check routes.toml     # validate a route set and show what would change
+yggdrasil ckr set routes.toml       # replace the live route set
+```
+
+`check` and `set` read the file on the client side (`-` reads standard input); the daemon never opens files on request. The file can be a full config file, a document with a top-level `[remote_subnets]` table, or a bare map of `"<key>" = [...]`, in TOML or JSON. So `yggdrasil ckr set /etc/yggdrasil/yggdrasil.toml` re-applies the routes in the config file after you edit it. Use `-e tcp://host:port` for a non-default `admin_listen`. With `--json`, the verbs print the daemon's reply and exit 1 if it reports an error; `ckr export --json` prints the bare map instead, which `ckr set` accepts back.
+
+- **Changes are not saved.** A restart reverts to the config file, as with `addPeer`/`removePeer`.
+- **Only `remote_subnets` changes.** Other `[tunnel_routing]` settings in the file are ignored; they only take effect at startup. CKR must be enabled at startup (`enable = true`).
+- **The whole set is replaced.** Keys missing from the file lose their routes. An empty `[tunnel_routing.remote_subnets]` section (or `{}`) clears every route. A file with no route set at all, such as a `[tunnel_routing]` table without `remote_subnets`, is rejected, so that a misspelt key cannot clear the routes.
+- **Invalid input changes nothing.** The new set is validated exactly as at startup, and a bad key, a malformed CIDR, a duplicate prefix or a Yggdrasil-space prefix rejects the whole request.
+- **The switch is atomic.** Packets use either the old table or the new one, never a mix.
+- **System routes follow the new set**, by the same rules as at startup (`install_system_routes`, no route for `~` entries or the node's own key). New routes are added first, then dropped ones are removed, so a prefix being dropped is never sent out the default route along the way. Routes that fail to install, at startup or on a `set`, are reported and retried on the next `set`. Only routes the node added itself are ever removed, on a `set` or at shutdown; a route that was already there, such as the on-link route of the TUN's own subnet, is left alone.
+
+### Admin socket
+
+`getckrroutes` (no arguments) returns `{"enabled": false}` when CKR is off, otherwise:
+
+```json
+{
+  "enabled": true,
+  "yggdrasil_routing": true,
+  "install_system_routes": true,
+  "tun": "ygg0",
+  "ipv4_routes": 31,
+  "ipv6_routes": 1,
+  "system_routes": 30,
+  "failed_system_routes": [],
+  "remote_subnets": [
+    { "key": "<hex>", "address": "200:…", "self": false,
+      "subnets": ["10.0.0.0/24", "~10.1.0.0/16", "!10.0.0.5"] }
+  ]
+}
+```
+
+`tun` is `null` without a TUN. `ipv4_routes`/`ipv6_routes` count table entries after expansion; `system_routes` counts the system routes the node installed for the set; `failed_system_routes` lists the ones it asks for that failed to install. `self: true` marks entries for the node's own key, which are kept but ignored.
+
+`setckrroutes` takes `remote_subnets` (required: an object mapping hex keys to arrays of strings) and `dry_run` (optional bool, default `false`):
+
+```json
+{"request": "setckrroutes", "arguments": {"remote_subnets": {"<hex>": ["10.0.0.0/24"]}, "dry_run": true}}
+```
+
+It returns `applied` (`false` for a dry run), `ipv4_routes`, `ipv6_routes`, `system_routes_added`, `system_routes_removed` (for a dry run, the ones that would be) and `system_route_failures` (a list of `{prefix, error}`).
+
+> **Warning:** anyone who can reach the admin socket can now redirect tunnelled traffic, including installing `inetv4`-style default routes into the tunnel. The admin socket is unauthenticated, so keep `admin_listen` on localhost and make sure no untrusted local user can reach it.
 
 ## Exit-Node Setup
 
