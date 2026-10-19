@@ -15,3 +15,5 @@ pub mod transport;
 #[cfg(feature = "tun")]
 pub mod tun;
 pub mod version;
+#[cfg(feature = "metrics")]
+pub mod metrics;

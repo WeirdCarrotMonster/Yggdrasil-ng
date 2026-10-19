@@ -45,6 +45,11 @@ listen = ["tcp://0.0.0.0:0"]
 # Uncomment the line below and set `admin_listen = ""` to disable the admin socket.
 # admin_listen = "tcp://localhost:9001"
 
+# Listen address for the Prometheus metrics HTTP endpoint.
+# Exposes per-peer and per-session byte counters, rates, uptime, and routing stats.
+# Set to "" or "none" to disable. Requires the `metrics` build feature (on by default).
+# metrics_listen = "tcp://localhost:9100"
+
 # Name of the TUN interface to use.
 # "auto" = automatically assign a name.
 # "none" = disable the TUN interface (useful for router-only nodes).
