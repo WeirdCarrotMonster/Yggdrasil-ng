@@ -160,9 +160,13 @@ async fn handle_admin_conn(stream: tokio::net::TcpStream, core: Arc<Core>) {
 
 async fn handle_request(req: &AdminRequest, core: &Arc<Core>) -> Result<serde_json::Value, String> {
     match req.request.to_lowercase().as_str() {
-        "list" => Ok(serde_json::json!({
-            "list": ["list", "getself", "getpeers", "gettree", "getpaths", "getsessions", "gettun", "getmulticastinterfaces", "addpeer", "removepeer", "getdebug", "getlookup", "forcelookup", "getnodeinfo", "debug_remotegetself", "debug_remotegetpeers", "debug_remotegettree"],
-        })),
+        "list" => {
+            #[allow(unused_mut)]
+            let mut list = vec!["list", "getself", "getpeers", "gettree", "getpaths", "getsessions", "gettun", "getmulticastinterfaces", "addpeer", "removepeer", "getdebug", "getlookup", "forcelookup", "getnodeinfo", "debug_remotegetself", "debug_remotegetpeers", "debug_remotegettree"];
+            #[cfg(feature = "ckr")]
+            list.extend(["getckrroutes", "setckrroutes"]);
+            Ok(serde_json::json!({ "list": list }))
+        }
 
         "getself" => {
             let routing_entries = core.routing_entries().await;
@@ -541,11 +545,43 @@ async fn handle_request(req: &AdminRequest, core: &Arc<Core>) -> Result<serde_js
             }))
         }
 
+        #[cfg(feature = "ckr")]
+        "getckrroutes" => match ckr_manager(core) {
+            Some(mgr) => serde_json::to_value(mgr.snapshot().await).map_err(|e| e.to_string()),
+            None => Ok(serde_json::json!({ "enabled": false })),
+        },
+
+        #[cfg(feature = "ckr")]
+        "setckrroutes" => {
+            // Required: `{}` is the explicit way to clear every route.
+            let remote_subnets = match req.arguments.get("remote_subnets") {
+                None | Some(serde_json::Value::Null) => return Err("missing 'remote_subnets' argument".to_string()),
+                Some(v) => serde_json::from_value(v.clone())
+                    .map_err(|e| format!("'remote_subnets' must map keys to arrays of strings: {}", e))?,
+            };
+            let dry_run = match req.arguments.get("dry_run") {
+                None | Some(serde_json::Value::Null) => false,
+                Some(serde_json::Value::Bool(b)) => *b,
+                Some(_) => return Err("'dry_run' must be a boolean".to_string()),
+            };
+            let mgr = ckr_manager(core).ok_or(
+                "CKR is not enabled (tunnel_routing.enable = false at startup); enable it in the config and restart",
+            )?;
+            let report = mgr.set_remote_subnets(remote_subnets, dry_run).await?;
+            serde_json::to_value(report).map_err(|e| e.to_string())
+        }
+
         other => Err(format!(
             "unknown action '{}', try 'list' for help",
             other
         )),
     }
+}
+
+/// The CKR route manager, when CKR was enabled at startup.
+#[cfg(feature = "ckr")]
+fn ckr_manager(core: &Core) -> Option<Arc<crate::ckr::CkrManager>> {
+    core.rwc().and_then(|rwc| rwc.ckr().cloned())
 }
 
 async fn write_response(writer: &mut tokio::net::tcp::OwnedWriteHalf, resp: &AdminResponse) -> Result<(), std::io::Error> {

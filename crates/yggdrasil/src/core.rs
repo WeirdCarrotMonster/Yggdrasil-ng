@@ -176,6 +176,11 @@ impl Core {
         *slot = Some(rwc);
     }
 
+    /// The ReadWriteCloser wired up by `set_path_notify`, if any.
+    pub fn rwc(&self) -> Option<Arc<ReadWriteCloser>> {
+        self.path_notify_slot.lock().unwrap().clone()
+    }
+
     /// Read a traffic packet from ironwood into `buf`, returning the range of
     /// `buf` holding the payload (i.e. the frame minus the session type byte).
     ///
