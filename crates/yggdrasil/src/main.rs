@@ -92,6 +92,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         let endpoint = matches.opt_str("endpoint")
             .unwrap_or_else(|| "tcp://localhost:9001".to_string());
         let json_output = matches.opt_present("json");
+
         let command = matches.free[0].clone();
 
         // Parse key=value arguments
@@ -392,8 +393,6 @@ async fn run_node(
             &config.if_dns_servers,
             #[cfg(feature = "ckr")]
             Some(&config.tunnel_routing),
-            #[cfg(feature = "ckr")]
-            core.public_key(),
         ).await {
             Ok(tun) => {
                 tracing::info!("TUN adapter started");
@@ -449,16 +448,10 @@ async fn run_node(
     // Cleanup
     // Remove CKR routes before TUN is destroyed (critical on Windows where
     // routes don't auto-dissolve when the interface goes away).
-    // Use the name the adapter got, not a second derivation of if_name.
-    #[cfg(all(feature = "ckr", feature = "tun"))]
-    if config.tunnel_routing.enable {
-        if let Some(adapter) = tun.as_ref() {
-            yggdrasil::ckr::remove_routes(
-                &config.tunnel_routing,
-                adapter.name(),
-                core.public_key(),
-            );
-        }
+    // The manager removes the routes of the live set, runtime changes included.
+    #[cfg(feature = "ckr")]
+    if let Some(mgr) = rwc.ckr() {
+        mgr.shutdown().await;
     }
 
     // Tear down TUN explicitly so the OS interface is removed before this

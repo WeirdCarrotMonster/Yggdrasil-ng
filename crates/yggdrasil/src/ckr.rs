@@ -1,12 +1,15 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 #[cfg(not(target_os = "android"))]
 use route_manager::RouteManager;
+use serde::{Deserialize, Serialize};
 
-use crate::address::{is_valid_address, is_valid_subnet};
+use crate::address::{addr_for_key, is_valid_address, is_valid_subnet};
 use crate::config::TunnelRoutingConfig;
 
 const INETV4_PREFIXES: &[&str] = &[
@@ -97,6 +100,13 @@ impl CryptoKey {
     /// shared config can thus be distributed to every node without each
     /// needing a node-specific copy.
     pub fn new(config: &TunnelRoutingConfig, self_key: &[u8; 32]) -> Result<Self, String> {
+        let ckr = Self::build(config, self_key)?;
+        ckr.log_routes();
+        Ok(ckr)
+    }
+
+    /// [`CryptoKey::new`] without logging the result as the active route set.
+    fn build(config: &TunnelRoutingConfig, self_key: &[u8; 32]) -> Result<Self, String> {
         let mut v4 = RouteTable::new(32);
         let mut v6 = RouteTable::new(128);
 
@@ -126,19 +136,26 @@ impl CryptoKey {
             }
         }
 
-        // Summarize at info, list at debug: one info line per route meant
-        // >100k synchronous writes (each allocating via hex::encode) before
-        // the TUN came up.
-        if !v4.is_empty() || !v6.is_empty() {
-            tracing::info!("Active CKR routes: {} IPv4, {} IPv6", v4.len(), v6.len());
+        Ok(Self { yggdrasil_routing: config.yggdrasil_routing, v4, v6 })
+    }
+
+    /// Summarize at info, list at debug: one info line per route meant more
+    /// than 100k synchronous writes (each allocating via hex::encode) before
+    /// the TUN came up.
+    fn log_routes(&self) {
+        if !self.v4.is_empty() || !self.v6.is_empty() {
+            tracing::info!("Active CKR routes: {} IPv4, {} IPv6", self.v4.len(), self.v6.len());
         }
         if tracing::enabled!(tracing::Level::DEBUG) {
-            for (prefix, dest) in v6.iter_sorted().chain(v4.iter_sorted()) {
+            for (prefix, dest) in self.v6.iter_sorted().chain(self.v4.iter_sorted()) {
                 tracing::debug!("  {} via {}", prefix, hex::encode(dest));
             }
         }
+    }
 
-        Ok(Self { yggdrasil_routing: config.yggdrasil_routing, v4, v6 })
+    /// Number of table entries after expansion, as `(IPv4, IPv6)`.
+    pub fn route_counts(&self) -> (usize, usize) {
+        (self.v4.len(), self.v6.len())
     }
 
     /// Whether standard Yggdrasil address routing is enabled.
@@ -159,6 +176,308 @@ impl CryptoKey {
             }
         }
     }
+}
+
+/// Owner of the live CKR route table and of the OS routes derived from it.
+///
+/// `remote_subnets` can be replaced at runtime ([`CkrManager::set_remote_subnets`])
+/// while packets keep flowing: readers take a cheap snapshot through
+/// [`CkrManager::table`], and a setter builds a new table off to the side and
+/// swaps it in atomically. Every other `tunnel_routing` setting is fixed at
+/// startup.
+pub struct CkrManager {
+    self_key: [u8; 32],
+    yggdrasil_routing: bool,
+    install_system_routes: bool,
+    table: ArcSwap<CryptoKey>,
+    /// Serialises setters, TUN attachment and shutdown, which hold it on a
+    /// blocking thread (see `with_state`) for the table build and the
+    /// RouteManager calls.
+    state: tokio::sync::Mutex<CkrState>,
+}
+
+struct CkrState {
+    /// The live route set; the table and the OS routes are derived from it.
+    remote_subnets: HashMap<String, Vec<String>>,
+    /// TUN the OS routes point at, once it is up.
+    tun: Option<String>,
+    /// OS routes this node added for the live set. Only these are ever
+    /// removed: a prefix whose add failed may be a route someone else owns,
+    /// such as the on-link route of the TUN's own subnet.
+    installed: HashSet<IpNet>,
+    /// OS routes the live set asks for that failed to install; retried by
+    /// the next set.
+    failed: HashSet<IpNet>,
+    /// Set by `shutdown`; later setters are refused.
+    closed: bool,
+}
+
+/// Result of [`CkrManager::set_remote_subnets`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CkrApplyReport {
+    /// False for a dry run: nothing was changed.
+    pub applied: bool,
+    pub ipv4_routes: usize,
+    pub ipv6_routes: usize,
+    /// OS routes added and removed (for a dry run, the ones that would be).
+    pub system_routes_added: Vec<String>,
+    pub system_routes_removed: Vec<String>,
+    pub system_route_failures: Vec<CkrRouteFailure>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CkrRouteFailure {
+    pub prefix: String,
+    pub error: String,
+}
+
+/// The live CKR state, as reported by the `getckrroutes` admin command.
+#[derive(Debug, Serialize)]
+pub struct CkrSnapshot {
+    pub enabled: bool,
+    pub yggdrasil_routing: bool,
+    pub install_system_routes: bool,
+    /// `None` when there is no TUN.
+    pub tun: Option<String>,
+    /// Table entries after expansion.
+    pub ipv4_routes: usize,
+    pub ipv6_routes: usize,
+    /// OS routes installed for the live set.
+    pub system_routes: usize,
+    pub failed_system_routes: Vec<String>,
+    /// Sorted by key.
+    pub remote_subnets: Vec<CkrKeySubnets>,
+}
+
+/// One `remote_subnets` entry, with the subnet strings as configured.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CkrKeySubnets {
+    pub key: String,
+    /// Yggdrasil address of `key`; `None` if the key does not decode.
+    pub address: Option<String>,
+    /// The node's own key: kept in the set but ignored, as at startup.
+    #[serde(rename = "self")]
+    pub is_self: bool,
+    pub subnets: Vec<String>,
+}
+
+impl CkrManager {
+    /// Build the manager from the startup config. Called only when
+    /// `config.enable` is set. No OS routes are touched until
+    /// [`CkrManager::attach_tun`].
+    pub fn new(config: &TunnelRoutingConfig, self_key: &[u8; 32]) -> Result<Self, String> {
+        Ok(Self {
+            self_key: *self_key,
+            yggdrasil_routing: config.yggdrasil_routing,
+            // VpnService owns routing on Android, and route_manager is not built there.
+            install_system_routes: config.install_system_routes && cfg!(not(target_os = "android")),
+            table: ArcSwap::from_pointee(CryptoKey::new(config, self_key)?),
+            state: tokio::sync::Mutex::new(CkrState {
+                remote_subnets: config.remote_subnets.clone(),
+                tun: None,
+                installed: HashSet::new(),
+                failed: HashSet::new(),
+                closed: false,
+            }),
+        })
+    }
+
+    /// Whether standard Yggdrasil address routing is enabled.
+    pub fn yggdrasil_routing(&self) -> bool {
+        self.yggdrasil_routing
+    }
+
+    /// The current route table.
+    ///
+    /// The guard **must not be held across an `.await`**: arc-swap guards use
+    /// a small per-thread pool of debt slots, and holding many across awaits
+    /// in per-packet tasks spills to the slow path. Use it within a statement
+    /// or a short sync block.
+    pub fn table(&self) -> arc_swap::Guard<Arc<CryptoKey>> {
+        self.table.load()
+    }
+
+    /// Record the TUN and, with `install_system_routes`, install the OS
+    /// routes of the live set through it. Called once, when the TUN is up.
+    pub async fn attach_tun(self: &Arc<Self>, tun_name: &str) {
+        let tun = tun_name.to_string();
+        let result = self
+            .with_state(move |mgr, state| {
+                state.tun = Some(tun);
+                if mgr.install_system_routes {
+                    state.sync_routes(desired_system_routes(&state.remote_subnets, &mgr.self_key)?);
+                }
+                Ok(())
+            })
+            .await;
+        if let Err(e) = result {
+            tracing::error!("Failed to install CKR routes: {}", e);
+        }
+    }
+
+    /// Report the live route set.
+    pub async fn snapshot(&self) -> CkrSnapshot {
+        let state = self.state.lock().await;
+        let (ipv4_routes, ipv6_routes) = self.table().route_counts();
+        let mut remote_subnets: Vec<CkrKeySubnets> = state
+            .remote_subnets
+            .iter()
+            .map(|(key, subnets)| {
+                let decoded = parse_pubkey(key).ok();
+                CkrKeySubnets {
+                    key: key.clone(),
+                    address: decoded.map(|k| addr_for_key(&k).to_string()),
+                    is_self: decoded == Some(self.self_key),
+                    subnets: subnets.clone(),
+                }
+            })
+            .collect();
+        remote_subnets.sort_by(|a, b| a.key.cmp(&b.key));
+        CkrSnapshot {
+            enabled: true,
+            yggdrasil_routing: self.yggdrasil_routing,
+            install_system_routes: self.install_system_routes,
+            tun: state.tun.clone(),
+            ipv4_routes,
+            ipv6_routes,
+            system_routes: state.installed.len(),
+            failed_system_routes: sorted_strings(state.failed.iter().copied().collect()),
+            remote_subnets,
+        }
+    }
+
+    /// Replace the whole `remote_subnets` set.
+    ///
+    /// The new table is built and validated first; any error leaves
+    /// everything untouched. Otherwise the table is swapped in atomically and
+    /// the OS routes, when managed, follow: new ones added first, then the
+    /// dropped ones removed. In between, a prefix being removed still has an
+    /// OS route into the TUN but no table entry, so its packets are dropped
+    /// rather than leaked to the default route. With `dry_run` nothing
+    /// changes, and the report says what would.
+    pub async fn set_remote_subnets(
+        self: &Arc<Self>,
+        remote_subnets: HashMap<String, Vec<String>>,
+        dry_run: bool,
+    ) -> Result<CkrApplyReport, String> {
+        self.with_state(move |mgr, state| mgr.apply(state, remote_subnets, dry_run)).await
+    }
+
+    /// Remove the OS routes of the live set and refuse later setters. Runs
+    /// after a set already in progress.
+    pub async fn shutdown(self: &Arc<Self>) {
+        let result = self
+            .with_state(|_, state| {
+                state.closed = true;
+                state.sync_routes(HashSet::new());
+                Ok(())
+            })
+            .await;
+        if let Err(e) = result {
+            tracing::warn!("Failed to remove CKR routes: {}", e);
+        }
+    }
+
+    /// Run `f` under the state lock on a blocking thread: a large set takes
+    /// seconds to expand, and every OS route is a syscall.
+    async fn with_state<T: Send + 'static>(
+        self: &Arc<Self>,
+        f: impl FnOnce(&Self, &mut CkrState) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        let mgr = self.clone();
+        tokio::task::spawn_blocking(move || f(&mgr, &mut mgr.state.blocking_lock()))
+            .await
+            .map_err(|e| format!("CKR update task failed: {}", e))?
+    }
+
+    fn apply(
+        &self,
+        state: &mut CkrState,
+        remote_subnets: HashMap<String, Vec<String>>,
+        dry_run: bool,
+    ) -> Result<CkrApplyReport, String> {
+        if state.closed {
+            return Err("node is shutting down".to_string());
+        }
+        let config = TunnelRoutingConfig {
+            enable: true,
+            yggdrasil_routing: self.yggdrasil_routing,
+            remote_subnets,
+            ..Default::default()
+        };
+        let table = CryptoKey::build(&config, &self.self_key)?;
+        let routes = if self.install_system_routes && state.tun.is_some() {
+            desired_system_routes(&config.remote_subnets, &self.self_key)?
+        } else {
+            HashSet::new()
+        };
+        let (ipv4_routes, ipv6_routes) = table.route_counts();
+
+        let (added, removed, failures) = if dry_run {
+            let (add, remove) = state.route_diff(&routes);
+            (add, remove, Vec::new())
+        } else {
+            table.log_routes();
+            self.table.store(Arc::new(table));
+            state.remote_subnets = config.remote_subnets;
+            let (mut add, remove, failures) = state.sync_routes(routes);
+            add.retain(|p| !state.failed.contains(p));
+            tracing::info!(
+                "CKR routes replaced: {} IPv4, {} IPv6; system routes +{} -{} ({} failed)",
+                ipv4_routes,
+                ipv6_routes,
+                add.len(),
+                remove.len(),
+                failures.len()
+            );
+            (add, remove, failures)
+        };
+
+        Ok(CkrApplyReport {
+            applied: !dry_run,
+            ipv4_routes,
+            ipv6_routes,
+            system_routes_added: sorted_strings(added),
+            system_routes_removed: sorted_strings(removed),
+            system_route_failures: failures
+                .into_iter()
+                .map(|(prefix, error)| CkrRouteFailure { prefix: prefix.to_string(), error })
+                .collect(),
+        })
+    }
+}
+
+impl CkrState {
+    /// The OS routes to add and remove to get from the installed ones to
+    /// `new`.
+    fn route_diff(&self, new: &HashSet<IpNet>) -> (Vec<IpNet>, Vec<IpNet>) {
+        (new.difference(&self.installed).copied().collect(), self.installed.difference(new).copied().collect())
+    }
+
+    /// Move the OS routes via the TUN to `new`. Returns the prefixes tried
+    /// to add and remove, and the adds that failed.
+    fn sync_routes(&mut self, new: HashSet<IpNet>) -> (Vec<IpNet>, Vec<IpNet>, Vec<(IpNet, String)>) {
+        let (mut add, mut remove) = self.route_diff(&new);
+        add.sort_unstable();
+        remove.sort_unstable();
+        let failures = match &self.tun {
+            Some(tun) => {
+                let failures = install_route_set(&add, tun);
+                remove_route_set(&remove, tun);
+                failures
+            }
+            None => Vec::new(),
+        };
+        self.failed = failures.iter().map(|(p, _)| *p).collect();
+        self.installed = new;
+        self.installed.retain(|p| !self.failed.contains(p));
+        (add, remove, failures)
+    }
+}
+
+fn sorted_strings(mut nets: Vec<IpNet>) -> Vec<String> {
+    nets.sort_unstable();
+    nets.iter().map(IpNet::to_string).collect()
 }
 
 /// The bits of an address, right-aligned in a `u128`. IPv4 and IPv6 are always
@@ -405,53 +724,53 @@ fn parse_pubkey(hex_str: &str) -> Result<[u8; 32], String> {
     Ok(arr)
 }
 
-/// Install system routes for all configured CKR subnets, pointing them
-/// at the TUN interface so the OS sends that traffic into the tunnel.
-/// Works on Linux, Windows, and macOS. No-op on Android (VpnService handles routes).
-#[cfg(target_os = "android")]
-pub fn install_routes(
-    _config: &TunnelRoutingConfig,
-    _tun_name: &str,
-    _self_key: &[u8; 32],
-) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(not(target_os = "android"))]
-pub fn install_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[u8; 32]) -> Result<(), String> {
-    if !config.enable || !config.install_system_routes {
-        return Ok(());
-    }
-
-    // Collect all unique CIDRs from the config (expanded, excludes applied).
+/// The OS routes a route set asks for: own-key and `~` entries skipped,
+/// excludes applied.
+fn desired_system_routes(
+    remote_subnets: &HashMap<String, Vec<String>>,
+    self_key: &[u8; 32],
+) -> Result<HashSet<IpNet>, String> {
     // Skip entries whose destination is this node itself — those are handled
     // by the OS's native routing and should not be steered into the TUN.
-    let mut cidrs: Vec<IpNet> = Vec::new();
-    let mut seen: HashSet<IpNet> = HashSet::new();
-    for (pubkey_hex, subnet_list) in &config.remote_subnets {
+    let mut routes = HashSet::new();
+    for (pubkey_hex, subnet_list) in remote_subnets {
         if parse_pubkey(pubkey_hex).ok().as_ref() == Some(self_key) {
             continue;
         }
         let non_tilde_entries: Vec<String> = subnet_list.iter().filter(|s| !s.trim().starts_with('~')).cloned().collect();
         let route_list = normalize_subnet_entries(&non_tilde_entries);
-        for prefix in expand_cidrs(&route_list)? {
-            // Set-based dedup; the Vec keeps insertion order.
-            if seen.insert(prefix) {
-                cidrs.push(prefix);
-            }
-        }
+        routes.extend(expand_cidrs(&route_list)?);
     }
+    Ok(routes)
+}
 
+/// Add system routes for `cidrs`, pointing them at the TUN interface so the
+/// OS sends that traffic into the tunnel. Returns the prefixes that failed,
+/// with the error text. Works on Linux, Windows, and macOS. No-op on Android
+/// (VpnService handles routes).
+#[cfg(target_os = "android")]
+fn install_route_set(_cidrs: &[IpNet], _tun_name: &str) -> Vec<(IpNet, String)> {
+    Vec::new()
+}
+
+#[cfg(not(target_os = "android"))]
+fn install_route_set(cidrs: &[IpNet], tun_name: &str) -> Vec<(IpNet, String)> {
     if cidrs.is_empty() {
-        return Ok(());
+        return Vec::new();
     }
 
-    let mut manager =
-        RouteManager::new().map_err(|e| format!("failed to create route manager: {}", e))?;
+    let mut manager = match RouteManager::new() {
+        Ok(m) => m,
+        Err(e) => {
+            let e = format!("failed to create route manager: {}", e);
+            tracing::error!("Failed to install CKR routes: {}", e);
+            return cidrs.iter().map(|c| (*c, e.clone())).collect();
+        }
+    };
     let mut installed: usize = 0;
-    let mut failed: usize = 0;
+    let mut failures = Vec::new();
 
-    for cidr in &cidrs {
+    for cidr in cidrs {
         let route = route_manager::Route::new(cidr.network(), cidr.prefix_len())
             .with_if_name(tun_name.to_string());
 
@@ -461,46 +780,30 @@ pub fn install_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[
                 tracing::debug!("Installed route: {} via {}", cidr, tun_name);
             }
             Err(e) => {
-                failed += 1;
                 tracing::warn!("Failed to install route {} via {}: {}", cidr, tun_name, e);
+                failures.push((*cidr, e.to_string()));
             }
         }
     }
 
-    if failed > 0 {
-        tracing::info!("Installed {} CKR route(s) via {} ({} failed)", installed, tun_name, failed);
+    if !failures.is_empty() {
+        tracing::info!("Installed {} CKR route(s) via {} ({} failed)", installed, tun_name, failures.len());
     } else {
         tracing::info!("Installed {} CKR route(s) via {}", installed, tun_name);
     }
 
-    Ok(())
+    failures
 }
 
-/// Remove previously installed CKR routes from the system routing table.
+/// Remove system routes for `cidrs` from the TUN interface. Failures are
+/// logged at debug and otherwise ignored.
 #[cfg(target_os = "android")]
-pub fn remove_routes(_config: &TunnelRoutingConfig, _tun_name: &str, _self_key: &[u8; 32]) {}
+fn remove_route_set(_cidrs: &[IpNet], _tun_name: &str) {}
 
 #[cfg(not(target_os = "android"))]
-pub fn remove_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[u8; 32]) {
-    if !config.enable || !config.install_system_routes {
+fn remove_route_set(cidrs: &[IpNet], tun_name: &str) {
+    if cidrs.is_empty() {
         return;
-    }
-
-    let mut cidrs: Vec<IpNet> = Vec::new();
-    let mut seen: HashSet<IpNet> = HashSet::new();
-    for (pubkey_hex, subnet_list) in &config.remote_subnets {
-        if parse_pubkey(pubkey_hex).ok().as_ref() == Some(self_key) {
-            continue;
-        }
-        let non_tilde_entries: Vec<String> = subnet_list.iter().filter(|s| !s.trim().starts_with('~')).cloned().collect();
-        let route_list = normalize_subnet_entries(&non_tilde_entries);
-        if let Ok(expanded) = expand_cidrs(&route_list) {
-            for prefix in expanded {
-                if seen.insert(prefix) {
-                    cidrs.push(prefix);
-                }
-            }
-        }
     }
 
     let mut manager = match RouteManager::new() {
@@ -511,7 +814,7 @@ pub fn remove_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[u
         }
     };
 
-    for cidr in &cidrs {
+    for cidr in cidrs {
         let route = route_manager::Route::new(cidr.network(), cidr.prefix_len())
             .with_if_name(tun_name.to_string());
         if let Err(e) = manager.delete(&route) {
@@ -1244,5 +1547,164 @@ mod tests {
         assert!(ckr.v6.is_empty());
         // Covers: multiple entries in ip_addresses (IPv4 + bare + IPv6), deprecated ipv4_address present but ignored per the new precedence rule,
         // and that CKR route parsing still succeeds (the core of the "TUN assignment only" intent of the original test).
+    }
+
+    fn subnets_of(entries: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.iter().map(|s| s.to_string()).collect()))
+            .collect()
+    }
+
+    fn manager(entries: &[(&str, &[&str])]) -> Arc<CkrManager> {
+        Arc::new(CkrManager::new(&make_config(subnets_of(entries)), &SELF_KEY).unwrap())
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn nets(list: &[&str]) -> HashSet<IpNet> {
+        list.iter().map(|s| s.parse().unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn test_manager_replaces_table() {
+        let (k1, k2) = (dummy_key_hex(), other_key_hex());
+        let mgr = manager(&[(&k1, &["10.0.0.0/24"])]);
+        let before = mgr.table().clone();
+
+        let report = mgr
+            .set_remote_subnets(subnets_of(&[(&k2, &["10.1.0.0/24", "2001:db8::/32"])]), false)
+            .await
+            .unwrap();
+        assert!(report.applied);
+        assert_eq!((report.ipv4_routes, report.ipv6_routes), (1, 1));
+        // No TUN attached: the table changes, the OS routes are not touched.
+        assert!(report.system_routes_added.is_empty());
+
+        assert_eq!(mgr.table().get_public_key_for_address(ip("10.1.0.5")), Some([0x02; 32]));
+        assert_eq!(mgr.table().get_public_key_for_address(ip("10.0.0.5")), None);
+        // A table loaded before the swap keeps resolving the old routes.
+        assert_eq!(before.get_public_key_for_address(ip("10.0.0.5")), Some([0x01; 32]));
+
+        let snap = mgr.snapshot().await;
+        assert_eq!(snap.remote_subnets.len(), 1);
+        assert_eq!(snap.remote_subnets[0].key, k2);
+        assert_eq!(snap.remote_subnets[0].subnets, vec!["10.1.0.0/24", "2001:db8::/32"]);
+    }
+
+    #[tokio::test]
+    async fn test_manager_invalid_input_changes_nothing() {
+        let k1 = dummy_key_hex();
+        let mgr = manager(&[(&k1, &["10.0.0.0/24"])]);
+        let bad: [&[(&str, &[&str])]; 4] = [
+            &[(&k1, &["10.0.0.0/33"])],
+            &[("zz", &["10.1.0.0/24"])],
+            &[(&k1, &["10.1.0.0/24", "10.1.0.0/24"])],
+            &[(&k1, &["200::/7"])],
+        ];
+        for entries in bad {
+            for dry_run in [true, false] {
+                assert!(mgr.set_remote_subnets(subnets_of(entries), dry_run).await.is_err(), "{:?}", entries);
+            }
+        }
+        assert_eq!(mgr.table().get_public_key_for_address(ip("10.0.0.5")), Some([0x01; 32]));
+        assert_eq!(mgr.snapshot().await.remote_subnets[0].subnets, vec!["10.0.0.0/24"]);
+    }
+
+    #[tokio::test]
+    async fn test_manager_dry_run_changes_nothing() {
+        let k1 = dummy_key_hex();
+        let mgr = manager(&[(&k1, &["10.0.0.0/24"])]);
+        let report = mgr.set_remote_subnets(subnets_of(&[(&k1, &["10.1.0.0/24", "10.2.0.0/24"])]), true).await.unwrap();
+        assert!(!report.applied);
+        assert_eq!(report.ipv4_routes, 2);
+        assert_eq!(mgr.table().get_public_key_for_address(ip("10.0.0.5")), Some([0x01; 32]));
+        assert_eq!(mgr.table().get_public_key_for_address(ip("10.1.0.5")), None);
+        assert_eq!(mgr.snapshot().await.remote_subnets[0].subnets, vec!["10.0.0.0/24"]);
+    }
+
+    #[tokio::test]
+    async fn test_manager_empty_set_clears() {
+        let mgr = manager(&[(&dummy_key_hex(), &["10.0.0.0/24", "2001:db8::/32"])]);
+        mgr.set_remote_subnets(HashMap::new(), false).await.unwrap();
+        assert_eq!(mgr.table().route_counts(), (0, 0));
+        assert!(mgr.snapshot().await.remote_subnets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_manager_own_key_ignored() {
+        let own = hex::encode(SELF_KEY);
+        let mgr = manager(&[]);
+        let report = mgr.set_remote_subnets(subnets_of(&[(&own, &["10.0.0.0/24"])]), false).await.unwrap();
+        assert_eq!((report.ipv4_routes, report.ipv6_routes), (0, 0));
+        let snap = mgr.snapshot().await;
+        assert!(snap.remote_subnets[0].is_self);
+    }
+
+    #[tokio::test]
+    async fn test_manager_refuses_after_shutdown() {
+        let mgr = manager(&[]);
+        mgr.shutdown().await;
+        let err = mgr.set_remote_subnets(HashMap::new(), false).await.unwrap_err();
+        assert!(err.contains("shutting down"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn test_manager_attach_without_system_routes() {
+        let mut config = make_config(subnets_of(&[(&dummy_key_hex(), &["10.0.0.0/24"])]));
+        config.install_system_routes = false;
+        let mgr = Arc::new(CkrManager::new(&config, &SELF_KEY).unwrap());
+        mgr.attach_tun("tun-test").await;
+        let snap = mgr.snapshot().await;
+        assert_eq!(snap.tun.as_deref(), Some("tun-test"));
+        assert_eq!(snap.system_routes, 0);
+        let report = mgr.set_remote_subnets(subnets_of(&[(&other_key_hex(), &["10.1.0.0/24"])]), false).await.unwrap();
+        assert!(report.system_routes_added.is_empty() && report.system_routes_removed.is_empty());
+    }
+
+    #[test]
+    fn test_route_diff_and_sync() {
+        // No TUN, so sync_routes only does the bookkeeping.
+        let mut state = CkrState {
+            remote_subnets: HashMap::new(),
+            tun: None,
+            installed: nets(&["10.0.0.0/24", "10.4.0.0/24"]),
+            failed: nets(&["10.1.0.0/24", "10.2.0.0/24"]),
+            closed: false,
+        };
+        let new = nets(&["10.0.0.0/24", "10.1.0.0/24", "10.3.0.0/24"]);
+        let (add, remove) = state.route_diff(&new);
+        // New prefixes and failed ones still wanted are added; installed
+        // ones no longer wanted are removed. A failed one no longer wanted
+        // is left alone: it may be someone else's route.
+        assert_eq!(add.into_iter().collect::<HashSet<_>>(), nets(&["10.1.0.0/24", "10.3.0.0/24"]));
+        assert_eq!(remove, nets(&["10.4.0.0/24"]).into_iter().collect::<Vec<_>>());
+
+        let (add, remove, failures) = state.sync_routes(new.clone());
+        assert_eq!(add.len(), 2);
+        assert_eq!(remove.len(), 1);
+        assert!(failures.is_empty() && state.failed.is_empty());
+        assert_eq!(state.installed, new);
+
+        // Shutdown removes every installed route.
+        let (add, remove, _) = state.sync_routes(HashSet::new());
+        assert!(add.is_empty());
+        assert_eq!(remove.into_iter().collect::<HashSet<_>>(), new);
+    }
+
+    #[test]
+    fn test_desired_system_routes() {
+        let own = hex::encode(SELF_KEY);
+        let subnets = subnets_of(&[
+            (&dummy_key_hex(), &["10.0.0.0/24", "!10.0.0.0/25", "~10.9.0.0/16", "~inetv6", "2001:db8::1"]),
+            (&other_key_hex(), &["10.5.0.0/16"]),
+            (&own, &["10.7.0.0/16"]),
+        ]);
+        assert_eq!(
+            desired_system_routes(&subnets, &SELF_KEY).unwrap(),
+            nets(&["10.0.0.128/25", "2001:db8::1/128", "10.5.0.0/16"])
+        );
     }
 }

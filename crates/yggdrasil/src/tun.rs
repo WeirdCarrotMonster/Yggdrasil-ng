@@ -58,7 +58,6 @@ impl TunAdapter {
         mtu: u16,
         #[cfg(windows)] dns_servers: &[String],
         #[cfg(feature = "ckr")] ckr_config: Option<&crate::config::TunnelRoutingConfig>,
-        #[cfg(feature = "ckr")] self_key: &[u8; 32],
     ) -> Result<Self, String> {
         if name == "none" {
             return Err("TUN disabled".to_string());
@@ -164,12 +163,8 @@ impl TunAdapter {
         
         // Install CKR routes if configured
         #[cfg(feature = "ckr")]
-        if let Some(ckr_cfg) = ckr_config {
-            if ckr_cfg.install_system_routes {
-                if let Err(e) = crate::ckr::install_routes(ckr_cfg, &actual_name, self_key) {
-                    tracing::error!("Failed to install CKR routes: {}", e);
-                }
-            }
+        if let Some(mgr) = rwc.ckr() {
+            mgr.attach_tun(&actual_name).await;
         }
 
         // Assign DNS servers to the interface (Windows only). Non-fatal on error.
