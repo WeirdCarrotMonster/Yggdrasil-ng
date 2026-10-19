@@ -93,6 +93,13 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|| "tcp://localhost:9001".to_string());
         let json_output = matches.opt_present("json");
 
+        // `ckr` verbs take positional arguments (a file or `-`), not
+        // key=value pairs, and send JSON objects the generic path cannot.
+        #[cfg(feature = "ckr")]
+        if matches.free[0].eq_ignore_ascii_case("ckr") {
+            return yggdrasil::ctl::run_ckr(&endpoint, json_output, &matches.free[1..]).await;
+        }
+
         let command = matches.free[0].clone();
 
         // Parse key=value arguments
@@ -552,4 +559,11 @@ fn print_ctl_commands() {
     println!("    debug_remoteGetPeers key=<hex>, debug_remoteGetTree key=<hex>");
     println!("  Path diagnostics:");
     println!("    getLookup key=<hex>, forceLookup key=<hex>");
+    #[cfg(feature = "ckr")]
+    {
+        println!("  CKR routes (runtime only, not saved to the config):");
+        for line in yggdrasil::ctl::CKR_VERBS.lines() {
+            println!("    {}", line);
+        }
+    }
 }
