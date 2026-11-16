@@ -3,6 +3,15 @@
 A Rust rewrite of the [Yggdrasil Network](https://yggdrasil-network.github.io/) — an early-stage implementation of a fully end-to-end encrypted IPv6 networking protocol.
 This project aims to provide a lightweight, self-arranging, and secure mesh network alternative to the original Go implementation.
 
+## About this fork
+
+This is a fork of [Revertron/Yggdrasil-ng](https://github.com/Revertron/Yggdrasil-ng) that tracks upstream and adds:
+
+- **Multiple links per peer** — several simultaneous links to one peer over different transports all stay up; `max_inbound_links_per_peer` caps how many one remote key can open to us.
+- **TUN segmentation offload** — `if_gso = true` (Linux) batches TUN reads and writes; see [docs/GSO.md](docs/GSO.md). Also adds a `profiling` build profile.
+- **Prometheus metrics** — per-peer and per-session counters, rates and routing stats on `metrics_listen` (`metrics` build feature).
+- **Runtime CKR routes** — replace the CKR route set without a restart via `yggdrasil ckr list|export|check|set` or the admin socket; see [docs/CKR.md](docs/CKR.md#changing-routes-at-runtime).
+
 ## Features
 
 - **End-to-end encryption** for all network traffic using XSalsa20-Poly1305 (RustCrypto implementation)
